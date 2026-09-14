@@ -16,6 +16,7 @@ from datetime import datetime
 
 import caldav
 import policy
+import store
 
 # Lane key -> (collection, display name). Order is the board order.
 LANES: dict[str, tuple[str, str]] = {
@@ -146,6 +147,46 @@ def alarm_time_for(row, cfg: dict | None = None) -> datetime | None:
     except ValueError:
         return None
     return policy.next_open(row["track"], due, cfg)
+
+
+def audit(conn) -> list[dict]:
+    """Every active task whose card does not match the database.
+
+    Exists because pushes can fail. write_task() raising CalDavError is logged
+    and not retried, so a card can sit stale indefinitely -- and until
+    parse_vtodo kept PRIORITY/DUE, nothing could even see it had happened.
+
+    One multiget per lane, not one GET per task.
+    """
+    cards: dict[str, dict] = {}
+    for lane, (collection, _) in LANES.items():
+        try:
+            for item in caldav.list_todos(collection):
+                cards[item["uid"]] = dict(item, lane=lane)
+        except caldav.CalDavError as e:
+            print(f"[audit] {lane}: {e}", flush=True)
+
+    out = []
+    for row in store.active_tasks(conn):
+        tid = row["id"]
+        want_pri = _priority(row["score"] or 0.0)
+        want_lane = LANE_ALIASES.get(row["lane"], row["lane"])
+        card = cards.get(tid)
+        if card is None:
+            out.append({"id": tid, "summary": row["title"], "problem": "missing from the board",
+                        "want": {"lane": want_lane, "priority": want_pri}, "got": None})
+            continue
+        bad = {}
+        if card.get("priority") != want_pri:
+            bad["priority"] = {"want": want_pri, "got": card.get("priority")}
+        if card.get("lane") != want_lane:
+            bad["lane"] = {"want": want_lane, "got": card.get("lane")}
+        want_alarm = alarm_time_for(row) is not None
+        if bool(card.get("has_alarm")) != want_alarm:
+            bad["alarm"] = {"want": want_alarm, "got": bool(card.get("has_alarm"))}
+        if bad:
+            out.append({"id": tid, "summary": row["title"], "problem": "stale card", "diff": bad})
+    return out
 
 
 def reconcile(conn) -> dict:

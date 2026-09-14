@@ -133,21 +133,36 @@ def build_vtodo(uid: str, summary: str, *, due: datetime | None = None,
 
 
 def parse_vtodo(text: str) -> dict:
-    """Pull back only what the brain acts on."""
+    """Pull back what the brain acts on, plus what it needs to verify.
+
+    PRIORITY, DUE and VALARM used to be discarded here. That made divergence
+    between the database and the board undetectable: a push that failed left a
+    stale card and nothing could see it, because the only view of a card
+    omitted every field worth comparing. They are kept now so board.audit()
+    can diff the two.
+    """
     result: dict = {"uid": None, "summary": "", "status": "NEEDS-ACTION",
-                    "completed_at": None, "description": ""}
+                    "completed_at": None, "description": "",
+                    "priority": None, "due": None,
+                    "has_alarm": False, "alarm_trigger": None}
     in_alarm = False
     for line in _unfold(text):
         if line.startswith("BEGIN:VALARM"):
             in_alarm = True
+            result["has_alarm"] = True
             continue
         if line.startswith("END:VALARM"):
             in_alarm = False
             continue
-        if in_alarm or ":" not in line:
+        if ":" not in line:
             continue
         name, _, value = line.partition(":")
         key = name.split(";")[0].upper()
+        if in_alarm:
+            # Only the trigger matters; the rest of the alarm is boilerplate.
+            if key == "TRIGGER":
+                result["alarm_trigger"] = value.strip()
+            continue
         if key == "UID":
             result["uid"] = value.strip()
         elif key == "SUMMARY":
@@ -158,6 +173,13 @@ def parse_vtodo(text: str) -> dict:
             result["status"] = value.strip().upper()
         elif key == "COMPLETED":
             result["completed_at"] = value.strip()
+        elif key == "PRIORITY":
+            try:
+                result["priority"] = int(value.strip())
+            except ValueError:
+                pass
+        elif key == "DUE":
+            result["due"] = value.strip()
     return result
 
 

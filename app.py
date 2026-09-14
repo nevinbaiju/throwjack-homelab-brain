@@ -377,6 +377,34 @@ async def project_status(slug: str, authorization: str | None = Header(default=N
         conn.close()
 
 
+@app.post("/repush")
+async def repush(check: bool = False, authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Diff every active task against its card, and optionally repair.
+
+    A board write that raises CalDavError is logged, not retried, so a card can
+    drift from the database and stay that way. `check=true` reports the drift;
+    without it, each divergent task is re-pushed.
+    """
+    _require_auth(authorization, session)
+    import store, board, triage
+    conn = store.connect()
+    try:
+        problems = board.audit(conn)
+        if check:
+            return {"divergent": len(problems), "items": problems}
+        repaired, failed = 0, []
+        for item in problems:
+            try:
+                triage.project_to_board(conn, item["id"])
+                repaired += 1
+            except Exception as e:
+                failed.append({"id": item["id"], "error": f"{type(e).__name__}: {e}"})
+        return {"divergent": len(problems), "repaired": repaired, "failed": failed}
+    finally:
+        conn.close()
+
+
 @app.post("/project/{slug}/sync")
 async def project_sync(slug: str, authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):

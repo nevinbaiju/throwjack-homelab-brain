@@ -28,8 +28,18 @@ case "${1:-board}" in
     curl -s -X POST "$URL/project/$slug/dump" -H "$AUTH" \
          -H 'Content-Type: text/plain' --data-binary @"$src"; echo ;;
   project) shift; curl -s "$URL/project/${1:?usage: ./brain.sh project <slug>}" -H "$AUTH" ;;
+  repush)
+    # Repair cards that drifted from the database. --check reports without
+    # changing anything. A failed board write is logged and never retried, so
+    # drift is possible and nothing else detects it.
+    shift
+    if [ "${1:-}" = "--check" ]; then
+      curl -s -X POST "$URL/repush?check=true" -H "$AUTH"; echo
+    else
+      curl -s -X POST "$URL/repush" -H "$AUTH"; echo
+    fi ;;
   sync)
-    # Manual only, by design. Pulls captures/ from one project, or all of them.
+    # The triage loop sweeps every project automatically. This forces it now.
     shift
     if [ $# -gt 0 ]; then
       curl -s -X POST "$URL/project/$1/sync" -H "$AUTH"; echo
