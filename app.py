@@ -44,7 +44,7 @@ _triage_again = threading.Event()
 
 def run_triage_once() -> dict:
     """Serialised, and coalescing: overlapping requests become one more pass."""
-    import store, triage
+    import store, triage, project
     if not _triage_lock.acquire(blocking=False):
         _triage_again.set()
         return {"queued": "a pass is already running; it will run again"}
@@ -54,7 +54,21 @@ def run_triage_once() -> dict:
             _triage_again.clear()
             conn = store.connect()
             try:
+                # Sweep every project's captures/ BEFORE triage so anything an
+                # agent dropped is in the inbox for this same pass. Files are
+                # moved into .ingested/ as they are read, so an empty captures/
+                # costs one directory listing and nothing else.
+                pulled = project.ingest_all_captures_by_project(conn)
                 result = triage.run(conn)
+                # Refresh context only for projects that actually moved.
+                for slug in pulled:
+                    try:
+                        project.write_context(conn, slug)
+                    except Exception as e:
+                        print(f"[triage] write_context({slug}) failed: "
+                              f"{type(e).__name__}: {e}", flush=True)
+                if pulled:
+                    result["from_projects"] = pulled
             finally:
                 conn.close()
             if not _triage_again.is_set():
@@ -383,10 +397,10 @@ async def project_sync(slug: str, authorization: str | None = Header(default=Non
 @app.post("/sync")
 async def sync_all(authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Manual sweep: pull captures/ from every project, triage, refresh context.
+    """Force a sweep now: pull captures/ from every project, triage, refresh.
 
-    Deliberately not on the triage timer — syncing is an action you take, not
-    something that happens behind you.
+    The triage loop does this automatically on every pass. This endpoint exists
+    for when you do not want to wait for the next one.
     """
     _require_auth(authorization, session)
     import store, project

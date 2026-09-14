@@ -122,10 +122,44 @@ def reorder_lanes(conn) -> dict[str, int]:
     return {}
 
 
+def rescore_and_sync(conn, summary: dict | None = None) -> dict:
+    """Rescore every active task, then push the ones whose PRIORITY bucket moved.
+
+    Order matters. board._priority() reads row["score"], so a card written
+    before rescore() lands at PRIORITY 9 regardless of what the task is worth --
+    which silently disabled the entire scoring model on the phone. Writing
+    after rescore fixes new tasks; re-pushing on a bucket change fixes existing
+    ones, whose urgency climbs as a deadline nears.
+
+    Only bucket changes are pushed, not every score change: a score drifting
+    from 130.0 to 131.2 renders identically in Reminders, and rewriting the
+    card would burn a CalDAV round trip and wake every synced device.
+    """
+    out = {"repriced": 0, "carded": 0}
+    before = {r["id"]: board._priority(r["score"] or 0.0)
+              for r in store.active_tasks(conn)}
+    rescore(conn)
+    for row in store.active_tasks(conn):
+        tid = row["id"]
+        now_bucket = board._priority(row["score"] or 0.0)
+        was = before.get(tid)
+        if was == now_bucket:
+            continue
+        try:
+            project_to_board(conn, tid)
+            out["carded" if was is None else "repriced"] += 1
+        except caldav.CalDavError as e:
+            print(f"[triage] board push failed for {tid}: {e}", flush=True)
+    if summary is not None:
+        summary["carded"] = summary.get("carded", 0) + out["carded"]
+        summary["repriced"] = summary.get("repriced", 0) + out["repriced"]
+    return out
+
+
 def run(conn, limit: int = 25) -> dict:
     run_id = store.start_run(conn, "triage")
     summary = {"reconciled": {}, "from_siri": 0, "ingested": 0, "triaged": 0,
-               "duplicates": 0, "failed": 0, "carded": 0}
+               "duplicates": 0, "failed": 0, "carded": 0, "repriced": 0}
     try:
         board.bootstrap()
         summary["reconciled"] = reconcile(conn)
@@ -133,6 +167,7 @@ def run(conn, limit: int = 25) -> dict:
         summary["ingested"] = ingest_inbox(conn)
         captures = [dict(r) for r in store.pending_captures(conn, limit)]
         if not captures:
+            rescore_and_sync(conn, summary)
             import escalate
             summary["escalated"] = escalate.run(conn)
             store.finish_run(conn, run_id, True, json.dumps(summary))
@@ -158,11 +193,7 @@ def run(conn, limit: int = 25) -> dict:
                 continue
             task_id = store.create_task(conn, **item)
             store.mark_capture(conn, item["capture_id"], "done", task_id)
-            try:
-                project_to_board(conn, task_id)
-                summary["carded"] += 1
-            except caldav.CalDavError as e:
-                store.finish_run(conn, run_id, False, f"board write failed: {e}")
+            # Deliberately NOT written to the board here -- see rescore_and_sync.
             summary["triaged"] += 1
 
         # Captures the model silently dropped must not vanish.
@@ -172,7 +203,7 @@ def run(conn, limit: int = 25) -> dict:
                 store.bump_attempt(conn, c["id"], "model omitted this capture")
                 summary["failed"] += 1
 
-        rescore(conn)
+        rescore_and_sync(conn, summary)
         import escalate
         summary["escalated"] = escalate.run(conn)
         sync_rollups(conn)

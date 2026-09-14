@@ -288,15 +288,32 @@ whose first step is not obvious does not get started.
     return root
 
 
-def ingest_all_captures(conn) -> int:
-    """Sweep every project's captures/ folder. Called by the triage loop."""
+def ingest_all_captures_by_project(conn) -> dict[str, int]:
+    """Sweep every project's captures/ folder, returning {slug: files_pulled}.
+
+    Only slugs that actually yielded files appear. The triage loop uses that to
+    rewrite STATE.md/tasks.json for exactly the projects that moved, instead of
+    churning every project's files on every pass -- which would also wake
+    Syncthing and every device holding those folders.
+
+    No change detection is needed: ingest_captures() *moves* each file into
+    captures/.ingested/, so a file still sitting in captures/ IS the signal.
+    Hashing would add state that can go stale for no benefit.
+    """
+    out: dict[str, int] = {}
     if not CONTEXTS.exists():
-        return 0
-    total = 0
+        return out
     for folder in sorted(CONTEXTS.iterdir()):
         if is_project_dir(folder):
-            total += ingest_captures(conn, folder.name)
-    return total
+            n = ingest_captures(conn, folder.name)
+            if n:
+                out[folder.name] = n
+    return out
+
+
+def ingest_all_captures(conn) -> int:
+    """Sweep every project's captures/ folder. Returns the total pulled."""
+    return sum(ingest_all_captures_by_project(conn).values())
 
 
 # An agent can close a task by dropping a capture whose first non-blank line
