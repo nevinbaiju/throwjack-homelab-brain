@@ -1,0 +1,7 @@
+# Copy to `users` (no extension) and change the password.
+# Then set the SAME password as CALDAV_PASSWORD in ../.env
+#
+# For anything beyond a first test, set htpasswd_encryption = bcrypt in
+# `config` and generate the hash rather than storing it in the clear:
+#   htpasswd -nbB youruser yourpassword
+youruser:change-me

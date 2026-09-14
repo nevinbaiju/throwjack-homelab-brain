@@ -1,0 +1,13 @@
+# Secrets. Never commit these — every one is a live credential.
+.env
+litellm.env
+.env.bak.*
+*.key
+*.pem
+
+# Local state
+__pycache__/
+*.pyc
+*.db
+*.db-*
+radicale/users

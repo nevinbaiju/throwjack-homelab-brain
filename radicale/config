@@ -1,0 +1,18 @@
+[server]
+# 0.0.0.0 is the bind INSIDE the container -- it has to be, or the podman
+# port mapping and the other containers' DNS name (radicale:5232) cannot reach
+# it. Exposure is restricted at the publish level instead: compose.yaml maps
+# 127.0.0.1:5232, and TLS is terminated in front (tailscale serve, or a
+# reverse proxy). Do not "harden" this to 127.0.0.1; it breaks the brain.
+hosts = 0.0.0.0:5232
+
+[auth]
+type = htpasswd
+htpasswd_filename = /etc/radicale/users
+htpasswd_encryption = bcrypt
+
+[storage]
+filesystem_folder = /data/collections
+
+[logging]
+level = info

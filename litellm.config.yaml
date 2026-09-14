@@ -1,0 +1,55 @@
+# Aliases the brain calls by name. Model ids below were verified against each
+# provider's live catalogue on 2026-09-11 — do not edit from memory, free-tier
+# catalogues churn. Re-check with each provider's /models endpoint.
+
+model_list:
+  # --- brain-fast: triage. Runs most often, wants speed. ---
+  - model_name: brain-fast
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: brain-fast-b1
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+  - model_name: brain-fast-b2
+    litellm_params:
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+  # --- brain-long: digest a project folder. Wants context, not speed. ---
+  - model_name: brain-long
+    litellm_params:
+      model: gemini/gemini-3.6-flash        # 1,048,576 token input limit
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: brain-long-b1
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-super-120b-a12b
+      api_key: os.environ/NVIDIA_NIM_API_KEY
+
+  # --- brain-plan: daily/weekly review. A few calls a day, wants judgement. ---
+  - model_name: brain-plan
+    litellm_params:
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/GEMINI_API_KEY
+  - model_name: brain-plan-b1
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+
+router_settings:
+  # Measured: 2 of 5 providers failed transiently in one test run (429, 503).
+  # The chain is the whole reason a free tier is usable here.
+  fallbacks:
+    - brain-fast: [brain-fast-b1, brain-fast-b2]
+    - brain-long: [brain-long-b1]
+    - brain-plan: [brain-plan-b1]
+  num_retries: 2
+  timeout: 120
+
+litellm_settings:
+  drop_params: true          # silently drop params a given provider rejects
+  set_verbose: false
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

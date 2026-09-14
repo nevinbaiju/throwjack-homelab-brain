@@ -1,0 +1,52 @@
+# Policy. Plain data, no secrets — safe to read, edit and version.
+# The brain reloads this on each worker tick, so edits take effect within
+# the minute. No restart needed.
+
+timezone: America/Los_Angeles
+
+# When the brain is allowed to make your phone buzz.
+# Windows are [start, end) — start minute included, end minute not.
+# A notification that comes due inside a closed window is HELD and delivered
+# when the window next opens. It is never dropped.
+notify:
+  # Your downtime. Nothing reaches the phone in this window, whatever it is.
+  # The only global rule; everything below is further restricted by it.
+  downtime:
+    start: "00:00"
+    end:   "10:00"
+
+  # Per-track windows, applied on top of downtime.
+  tracks:
+    meta:    { start: "10:00", end: "18:00" }   # work stays inside work hours
+    focus:   { start: "10:00", end: "24:00" }
+    flow:    { start: "10:00", end: "24:00" }
+    waiting: { start: "10:00", end: "24:00" }
+    upkeep:  { start: "10:00", end: "24:00" }
+    someday: null                               # never notifies, by design
+
+  # Same windows every day. If you ever want weekends quieter for meta,
+  # add: weekend_override: { meta: null }
+  weekend_override: {}
+
+# Scheduled pushes. Each is clamped to its track's window anyway; these are
+# just when the brain tries.
+schedule:
+  daily_plan:      "10:00"   # was 08:00 in the proposal — that is inside downtime
+  evening_review:  "21:00"
+  weekly_review:   "Sun 11:00"
+
+# How long an untouched item sits before it starts climbing its lane.
+# Used as the denominator in the urgency term: 1 + age_days / tolerance_days
+tolerance_days:
+  meta:    null    # meta sorts by the priority you set — no aging term
+  focus:   7
+  flow:    4
+  waiting: 3       # also the default chase interval
+  upkeep:  null    # upkeep uses cadence + the escalation ladder instead
+  someday: null
+
+focus_cap_per_project: 3
+
+# Retired with the move to CalDAV: Backlog is a real Reminders list now, so
+# every step is its own individually checkable item.
+group_backlog_by_project: false

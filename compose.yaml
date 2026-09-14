@@ -1,0 +1,111 @@
+services:
+  brain:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: brain
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - BRAIN_ROOT=/brain
+      - LITELLM_URL=http://litellm:4000
+      # isolate=true blocks container -> host-LAN, so 10.0.0.129 is refused.
+      # host.containers.internal is podman's route back to the host. Verified.
+      - TRIAGE_INTERVAL_SECONDS=600
+      - CALDAV_URL=http://radicale:5232
+      - CALDAV_USER=${CALDAV_USER:-admin}
+    volumes:
+      - ${BRAIN_DATA:-/var/mnt/storage/brain}:/brain:z
+      - /etc/localtime:/etc/localtime:ro
+    dns:
+      # The compose network is created with isolate=true, which blocks
+      # container -> host-LAN traffic, so AdGuard at 10.0.0.129 is NOT
+      # reachable from here and aardvark-dns (10.89.2.1) times out
+      # forwarding to Tailscale MagicDNS. Verified from inside the container.
+      # These are your existing host upstreams; 1.1.1.1 is the last resort.
+      # This bypasses AdGuard, which costs nothing: the only names resolved
+      # here are LLM provider APIs, and AdGuard is for client browsing.
+      - 75.75.75.75
+      - 75.75.76.76
+      - 1.1.1.1
+    ports:
+      - "5010:5010"
+    depends_on:
+      - litellm
+      - radicale
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: litellm
+    restart: unless-stopped
+    env_file:
+      - litellm.env
+    volumes:
+      - ./litellm.config.yaml:/app/config.yaml:z,ro
+      - /etc/localtime:/etc/localtime:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    dns:
+      # The compose network is created with isolate=true, which blocks
+      # container -> host-LAN traffic, so AdGuard at 10.0.0.129 is NOT
+      # reachable from here and aardvark-dns (10.89.2.1) times out
+      # forwarding to Tailscale MagicDNS. Verified from inside the container.
+      # These are your existing host upstreams; 1.1.1.1 is the last resort.
+      # This bypasses AdGuard, which costs nothing: the only names resolved
+      # here are LLM provider APIs, and AdGuard is for client browsing.
+      - 75.75.75.75
+      - 75.75.76.76
+      - 1.1.1.1
+    ports:
+      - "127.0.0.1:4000:4000"
+
+  # Self-hosted CalDAV. The phone talks to it through `tailscale serve`, which
+  # terminates TLS with a real certificate; the brain talks to it directly on
+  # the compose network. Storage is plain .ics on the mirrored array.
+  radicale:
+    build: ./radicale
+    container_name: radicale
+    restart: unless-stopped
+    user: "0:0"
+    volumes:
+      - ${RADICALE_DATA:-/var/mnt/storage/radicale}:/data:z
+      - ./radicale/config:/etc/radicale/config:z,ro
+      - ./radicale/users:/etc/radicale/users:z,ro
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - "127.0.0.1:5232:5232"
+
+  # Context sharing. Only contexts/ and journal/ sync — inbox/ and state/ stay
+  # server-only so there is never a second writer on the append log or the DB.
+  #
+  # Host networking because LAN peer discovery uses UDP broadcast on 21027,
+  # which does not cross a podman bridge. It also means sync traffic (22000)
+  # already listens on eno1 AND tailscale0, so devices reach each other over
+  # whichever path is up.
+  #
+  # STGUIADDRESS controls the WEB UI only. 0.0.0.0 so it answers on the LAN
+  # (10.0.0.129:8384) and the tailnet (100.72.216.38:8384) alike. Nothing
+  # forwards 8384 at the router, so this is not internet-exposed — but the LAN
+  # is now in scope, so set a GUI password on first run.
+  syncthing:
+    image: docker.io/syncthing/syncthing:2.1.5
+    container_name: syncthing
+    hostname: brain-server
+    restart: unless-stopped
+    network_mode: host
+    # Rootless podman UID mapping: host uid 1000 (throwjack) appears as ROOT
+    # inside the container, while container uid 1000 maps to host 525287, which
+    # owns nothing. So the image's default PUID=1000 cannot write the bind
+    # mounts and syncthing dies on "Failed to acquire lock". Running as
+    # container-root maps back to throwjack on the host, and every file it
+    # writes is owned by you. The other stacks work because they never set PUID.
+    user: "0:0"
+    environment:
+      - PUID=0
+      - PGID=0
+      - STGUIADDRESS=0.0.0.0:8384
+    volumes:
+      - ${SYNCTHING_CONFIG:-$HOME/.local/share/syncthing}:/var/syncthing/config:z
+      - ${BRAIN_DATA:-/var/mnt/storage/brain}/contexts:/sync/contexts:z
+      - ${BRAIN_DATA:-/var/mnt/storage/brain}/journal:/sync/journal:z
+      - /etc/localtime:/etc/localtime:ro

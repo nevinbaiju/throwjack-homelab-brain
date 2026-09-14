@@ -1,0 +1,63 @@
+# Recurring chores. YOURS to edit — the brain writes these into the Upkeep
+# list and then leaves them alone. They are NOT tasks: they never enter the
+# database, never appear on the board, and reconcile ignores them entirely.
+# iOS owns the recurrence, the alarm and the completion.
+#
+# Because they bypass the brain, quiet hours do NOT apply. "Go to sleep" at
+# 00:00 fires at 00:00, which is what you asked for.
+#
+#   at:      HH:MM, 24-hour, local time
+#   repeat:  daily | weekly | monthly | every N weeks | every N days
+#   day:     weekday, for weekly repeats (monday..sunday)
+#            Spell it `day`, not `on` — YAML treats `on` as a boolean, so
+#            `on: friday` silently loses the weekday. `on` is accepted anyway.
+#   alarm:   true (default) fires a notification; false is a silent checklist item
+#
+#   essential:       true means the brain speaks up when this goes badly
+#                    overdue. Default false — a non-essential chore never
+#                    interrupts you, it just sits in the list looking overdue.
+#   escalate_after:  how long past due before it says anything. Default 4h for
+#                    daily chores, 2d for anything less frequent.
+
+chores:
+  - title: Have breakfast
+    essential: true
+    at: "11:00"
+    repeat: daily
+
+  - title: Have lunch
+    essential: true
+    at: "15:00"
+    repeat: daily
+
+  - title: Have dinner
+    essential: true
+    at: "21:00"
+    repeat: daily
+
+  - title: Load the dishwasher
+    essential: true
+    at: "23:30"
+    repeat: daily
+
+  - title: Go to sleep
+    at: "00:00"
+    repeat: daily
+
+  - title: Laundry
+    at: "12:00"
+    repeat: weekly
+    day: friday
+
+  - title: Clean the floor
+    at: "12:00"
+    repeat: monthly
+
+  - title: Clean the bathroom
+    at: "12:00"
+    repeat: every 3 weeks
+
+  - title: Change the sheets
+    at: "12:00"
+    repeat: every 2 weeks
+    day: friday

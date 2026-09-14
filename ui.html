@@ -1,0 +1,194 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Brain</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans+Condensed:wght@600;700&family=IBM+Plex+Sans:wght@400;500&display=swap">
+<style>
+  :root{
+    --ground:#0E1115; --surface:#151A21; --raise:#1C222B;
+    --ink:#E3E8F0; --ink-2:#9CA6B6; --ink-3:#6E7889;
+    --rule:#262E39; --accent:#7FB3DB; --accent-ink:#0E1115;
+    --signal:#DD8A4E; --ok:#74B893;
+    --sans:"IBM Plex Sans",ui-sans-serif,system-ui,-apple-system,sans-serif;
+    --cond:"IBM Plex Sans Condensed","IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;
+    --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  }
+  @media (prefers-color-scheme: light){
+    :root:not([data-theme="dark"]){
+      --ground:#F1F3F7; --surface:#FFFFFF; --raise:#E8ECF3;
+      --ink:#12161C; --ink-2:#4C5666; --ink-3:#6E7889;
+      --rule:#D2D8E2; --accent:#17486B; --accent-ink:#FFFFFF;
+      --signal:#A84C1B; --ok:#2C6247;
+    }
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+       font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased;
+       display:flex;flex-direction:column;padding-inline:20px;
+       padding-block:max(20px,env(safe-area-inset-top)) max(20px,env(safe-area-inset-bottom))}
+  .wrap{width:100%;max-width:720px;margin-inline:auto;display:flex;flex-direction:column;
+        flex:1;min-height:0;gap:14px}
+  header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+  h1{font-family:var(--cond);font-weight:700;font-size:1.5rem;letter-spacing:-.01em;margin:0}
+  .hint{font-family:var(--mono);font-size:11.5px;color:var(--ink-3)}
+  .modes{display:flex;gap:2px;background:var(--raise);padding:3px;border-radius:8px;
+         border:1px solid var(--rule);width:fit-content}
+  .modes button{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.08em;
+    text-transform:uppercase;padding:7px 14px;border:0;border-radius:6px;cursor:pointer;
+    background:transparent;color:var(--ink-2)}
+  .modes button[aria-selected="true"]{background:var(--accent);color:var(--accent-ink)}
+  .modes button:focus-visible,textarea:focus-visible,#send:focus-visible,#slug:focus-visible{
+    outline:2px solid var(--signal);outline-offset:2px}
+  #slugrow{display:none;gap:8px;align-items:center}
+  #slugrow.on{display:flex}
+  #slugrow label{font-family:var(--mono);font-size:12px;color:var(--ink-3)}
+  #slug{flex:1;min-width:0;font-family:var(--mono);font-size:14px;padding:8px 10px;
+    background:var(--surface);color:var(--ink);border:1px solid var(--rule);border-radius:6px}
+  textarea{flex:1;min-height:180px;resize:none;width:100%;padding:16px;
+    background:var(--surface);color:var(--ink);border:1px solid var(--rule);border-radius:10px;
+    font-family:var(--sans);font-size:17px;line-height:1.55}
+  textarea::placeholder{color:var(--ink-3)}
+  .bar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  #send{font-family:var(--cond);font-weight:700;font-size:13px;letter-spacing:.08em;
+    text-transform:uppercase;padding:11px 22px;border:0;border-radius:8px;cursor:pointer;
+    background:var(--accent);color:var(--accent-ink)}
+  #send[disabled]{opacity:.5;cursor:default}
+  #status{font-family:var(--mono);font-size:12.5px;color:var(--ok);min-height:1.2em;
+    opacity:0;transition:opacity .18s}
+  #status.show{opacity:1}
+  #status.err{color:var(--signal)}
+  #recent{border-top:1px solid var(--rule);padding-top:10px;margin:0;list-style:none;
+    font-family:var(--mono);font-size:12px;color:var(--ink-3);
+    max-height:22vh;overflow-y:auto}
+  .linkish{background:none;border:0;padding:0;cursor:pointer;
+    font-family:var(--mono);font-size:11.5px;color:var(--ink-3);text-decoration:underline}
+  .linkish:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+  #recent li{padding:3px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>Brain</h1>
+    <span class="hint"><span id="kbd">⌘↵ to send</span> ·
+      <form method="post" action="/logout" style="display:inline">
+        <button type="submit" class="linkish">sign out</button>
+      </form></span>
+  </header>
+
+  <div class="modes" role="tablist">
+    <button role="tab" id="m-file" aria-selected="true">File task</button>
+    <button role="tab" id="m-plan" aria-selected="false">Plan task</button>
+  </div>
+
+  <div id="slugrow">
+    <label for="slug">project</label>
+    <input id="slug" list="slugs" placeholder="doordash" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <datalist id="slugs"></datalist>
+  </div>
+
+  <textarea id="text" autofocus
+    placeholder="One thing. It lands on disk before anything reads it."></textarea>
+
+  <div class="bar">
+    <button id="send">Send</button>
+    <span id="status" role="status" aria-live="polite"></span>
+  </div>
+
+  <ul id="recent" aria-label="recent captures"></ul>
+</div>
+
+<script>
+// No token here: the signed session cookie authenticates these fetches,
+// and it is httponly so this script cannot read or leak it.
+const H = {};
+const $ = id => document.getElementById(id);
+let mode = 'file';
+
+$('kbd').textContent = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘↵ to send' : 'Ctrl+↵ to send';
+
+function setMode(next){
+  mode = next;
+  $('m-file').setAttribute('aria-selected', next === 'file');
+  $('m-plan').setAttribute('aria-selected', next === 'plan');
+  $('slugrow').classList.toggle('on', next === 'plan');
+  $('text').placeholder = next === 'plan'
+    ? 'Everything you know about this project. Messy is fine — it gets broken into ordered steps, and your raw text is kept verbatim.'
+    : 'One thing. It lands on disk before anything reads it.';
+  $('text').focus();
+}
+$('m-file').onclick = () => setMode('file');
+$('m-plan').onclick = () => setMode('plan');
+
+function say(msg, bad){
+  const s = $('status');
+  s.textContent = msg;
+  s.classList.toggle('err', !!bad);
+  s.classList.add('show');
+  clearTimeout(say.t);
+  say.t = setTimeout(() => s.classList.remove('show'), 2600);
+}
+
+async function loadRecent(){
+  try{
+    const r = await fetch('/inbox/today', {headers: H});
+    if(r.status === 401 || r.redirected){ location.href = '/login'; return; }
+    if(!r.ok) return;
+    const lines = (await r.text()).trim().split('\n').filter(l => l.trim() && !l.startsWith('nothing'));
+    $('recent').innerHTML = lines.slice(-6).reverse()
+      .map(l => '<li>' + l.replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c])) + '</li>').join('');
+  }catch(e){}
+}
+
+async function loadProjects(){
+  try{
+    const r = await fetch('/projects', {headers: H});
+    if(!r.ok) return;
+    const slugs = await r.json();
+    $('slugs').innerHTML = slugs.map(s => '<option value="' + s + '">').join('');
+  }catch(e){}
+}
+
+async function send(){
+  const body = $('text').value.trim();
+  if(!body) return;
+  const slug = $('slug').value.trim();
+  if(mode === 'plan' && !slug){ say('name the project first', true); $('slug').focus(); return; }
+
+  // Clear immediately. Reading a confirmation is where the next thought dies.
+  $('text').value = '';
+  $('text').focus();
+  $('send').disabled = true;
+
+  const url = mode === 'plan' ? '/project/' + encodeURIComponent(slug) + '/dump' : '/capture';
+  if(mode === 'plan') say('planning… this takes up to a minute');
+
+  try{
+    const r = await fetch(url, {method:'POST', headers:{...H, 'Content-Type':'text/plain'}, body});
+    if(!r.ok) throw new Error(await r.text());
+    if(mode === 'plan'){
+      const d = await r.json();
+      say('planned: ' + d.created + ' steps, ' + d.started + ' started');
+      loadProjects();
+    } else {
+      say('caught');
+      loadRecent();
+    }
+  }catch(e){
+    // Never lose it: put the text back so you can retry or copy it out.
+    $('text').value = body;
+    say('failed — your text is still here', true);
+  }finally{
+    $('send').disabled = false;
+  }
+}
+
+$('send').onclick = send;
+document.addEventListener('keydown', e => {
+  if((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); }
+});
+loadRecent(); loadProjects();
+</script>
