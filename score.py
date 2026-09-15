@@ -18,6 +18,14 @@ from __future__ import annotations
 from datetime import date, datetime
 
 BASE = {"breaks": 100.0, "costs": 40.0, "improves": 12.0, "optional": 3.0}
+
+# A P0 is not a consequence, it is an override: "this outranks whatever else you
+# think is urgent". Set deliberately above any value the arithmetic can reach,
+# so a pinned task sorts first in every lane without special-casing the sort.
+# Note the ceiling this does NOT break: CalDAV PRIORITY only goes to 1, and
+# Reminders renders 1-3 identically, so on the phone a P0 looks like any other
+# "!!!" item. What actually makes it visible is being promoted first.
+PINNED_SCORE = 10_000.0
 QUICK_MINUTES = 15
 QUICK_BONUS = 1.3
 BLOCKING_MULTIPLIER = 2.0

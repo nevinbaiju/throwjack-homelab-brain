@@ -262,6 +262,7 @@ def apply_updates(conn, slug: str, updates: list[dict]) -> dict:
             except caldav.CalDavError as e:
                 print(f"[refactor] {u['id']} card not removed: {e}", flush=True)
             out["dropped"] += 1
+            log_event(slug, f"**dropped** `{u['id']}` — {row['title']}")
             continue
 
         sets, vals = [], []
@@ -275,6 +276,11 @@ def apply_updates(conn, slug: str, updates: list[dict]) -> dict:
             continue
         vals += [store.now_iso(), u["id"]]
         conn.execute(f"UPDATE tasks SET {', '.join(sets)}, updated_at=? WHERE id=?", vals)
+        if "title" in u:
+            log_event(slug, f"**retitled** `{u['id']}` — {row['title']!r} -> {u['title']!r}")
+        else:
+            log_event(slug, f"**rescoped** `{u['id']}` — {row['title']} "
+                            f"({', '.join(k for k in u if k != 'id')})")
         try:
             triage.project_to_board(conn, u["id"])
         except caldav.CalDavError as e:
@@ -355,12 +361,21 @@ or three real ones, the things you would need to know to do the work well and
 cannot find out yourself. Constraints, what he has already decided, what
 "done" looks like, what he is actually worried about.
 
-Then write what you learned into `dumps/` as a new markdown file and tell him
-to run `./brain.sh dump {slug}` — or write it as a capture and let the timer
-take it. The brain re-plans against the tasks that already exist: it can
-retitle a vague task, reorder the sequence, rescope an estimate, or drop work
-the new context has made irrelevant. That is the mechanism by which your
-understanding improves his board.
+Then write what you learned as a capture whose FIRST line is `replan:`
+
+    captures/{datetime.now():%Y-%m-%d}-what-i-learned.md
+    ---
+    replan:
+    <everything you now understand that the original plan did not>
+
+The brain picks that up on its own timer and re-plans against the tasks that
+already exist: it can retitle a vague task, reorder the sequence, rescope an
+estimate, or drop work the new context made irrelevant. Nevin does not have to
+run anything. That is the mechanism by which your understanding improves his
+board.
+
+Every capture, promotion, retitle and drop is appended to `LOG.md` in this
+folder, so you can see what the brain did with what you wrote.
 
 You cannot edit tasks directly, and should not try. Improve the context and
 the tasks follow.
@@ -411,6 +426,31 @@ whose first step is not obvious does not get started.
     return root
 
 
+def log_event(slug: str | None, line: str) -> None:
+    """Append one line to contexts/<slug>/LOG.md.
+
+    The board shows the current state and nothing about how it got there. When
+    a task appears retitled, or in a lane you did not put it in, there was no
+    way to tell what did it. Best-effort by design: a logging failure must
+    never take down a triage pass.
+    """
+    if not slug:
+        return
+    try:
+        root = CONTEXTS / slug
+        if not root.is_dir():
+            return
+        path = root / "LOG.md"
+        if not path.exists():
+            path.write_text("# Trace\n\nWhat the brain did, newest last. "
+                            "Written by the brain; safe to read, pointless to edit.\n\n",
+                            encoding="utf-8")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"- `{datetime.now():%Y-%m-%d %H:%M}`  {line}\n")
+    except OSError as e:
+        print(f"[log] {slug}: {e}", flush=True)
+
+
 def promote(conn, cfg: dict | None = None) -> dict:
     """Refill each project's In Progress from its backlog, and announce the move.
 
@@ -430,19 +470,33 @@ def promote(conn, cfg: dict | None = None) -> dict:
     now = datetime.now()
     out: dict = {"promoted": 0, "held": 0, "titles": []}
 
-    slugs = [r["project"] for r in conn.execute(
-        "SELECT DISTINCT project FROM tasks "
-        "WHERE archived=0 AND status!='completed' AND project IS NOT NULL AND project!=''")]
+    # Tasks with no project are their own group, not skipped. A P0 filed from
+    # the phone has no project, and "always outranks" cannot mean "except when
+    # it does not belong to anything".
+    groups = [r["project"] for r in conn.execute(
+        "SELECT DISTINCT project FROM tasks WHERE archived=0 AND status!='completed'")]
 
-    for slug in slugs:
-        room = FOCUS_CAP - store.in_progress_count(conn, slug)
-        if room <= 0:
-            continue
+    for slug in groups:
+        if slug:
+            scope, params = "project=?", (slug,)
+        else:
+            scope, params = "(project IS NULL OR project='')", ()
+        in_progress = conn.execute(
+            f"SELECT COUNT(*) c FROM tasks WHERE archived=0 AND status!='completed' "
+            f"AND {scope} AND lane='in_progress'", params).fetchone()["c"]
+        room = FOCUS_CAP - in_progress
+        stamp = now.isoformat(timespec="seconds")
+        # Pinned first, then sequence, then score. A P0 is an override: it is
+        # promoted even when In Progress is already at the cap, because the
+        # whole point of saying P0 is that it displaces the plan.
         candidates = conn.execute(
-            "SELECT * FROM tasks WHERE archived=0 AND status!='completed' "
-            "AND project=? AND lane='backlog' ORDER BY seq, score DESC", (slug,)).fetchall()
+            f"SELECT * FROM tasks WHERE archived=0 AND status!='completed' "
+            f"AND {scope} AND lane='backlog' "
+            f"ORDER BY CASE WHEN pinned_until IS NOT NULL AND pinned_until > ? "
+            f"THEN 0 ELSE 1 END, seq, score DESC", (*params, stamp)).fetchall()
         for row in candidates:
-            if room <= 0:
+            pinned = bool(row["pinned_until"]) and str(row["pinned_until"]) > stamp
+            if room <= 0 and not pinned:
                 break
             if not policy.can_notify(row["track"], now, cfg):
                 out["held"] += 1
@@ -466,7 +520,10 @@ def promote(conn, cfg: dict | None = None) -> dict:
                 board.write_task(conn, fresh, alarm_at=announce)
                 out["promoted"] += 1
                 out["titles"].append(fresh["title"])
-                room -= 1
+                log_event(slug, f"**promoted**{' (P0)' if pinned else ''} "
+                                f"`{row['id']}` — {fresh['title']}")
+                if not pinned:
+                    room -= 1
             except caldav.CalDavError as e:
                 # Put it back: a lane change the phone never saw is a lie.
                 conn.execute("UPDATE tasks SET lane='backlog' WHERE id=?", (row["id"],))
@@ -508,6 +565,12 @@ _DIRECTIVE_RE = re.compile(
     r"^\s*(?:---\s*\n\s*)?(done|doing|blocked|drop)\s*:\s*(t_[0-9a-f]{6,})\b",
     re.IGNORECASE | re.MULTILINE)
 
+# A capture whose first line is "replan:" is enriched CONTEXT, not a task. It
+# goes to the planner, which can refactor the tasks that already exist. This is
+# what makes dumps/ optional: an agent writes one file and the timer does the
+# rest, with no command for Nevin to remember.
+_REPLAN_RE = re.compile(r"^\s*(?:replan|context)\s*:[ \t]*", re.IGNORECASE)
+
 _DIRECTIVE_LANE = {"done": ("done", "completed"), "doing": ("in_progress", "needs_action"),
                    "blocked": ("waiting", "needs_action"), "drop": (None, None)}
 
@@ -530,6 +593,8 @@ def apply_directive(conn, text: str) -> str | None:
         conn.execute(
             "UPDATE tasks SET lane=?, status=?, completed_at=?, touched_at=?, updated_at=? WHERE id=?",
             (lane, status, ts if status == "completed" else None, ts, ts, task_id))
+
+    log_event(row["project"], f"**{verb}** `{task_id}` — {row['title']}")
 
     # Reflect it on the phone. write_task moves the item to the new lane and
     # sets STATUS itself, keeping the same uid, so there is nothing to clean up.
@@ -561,6 +626,25 @@ def ingest_captures(conn, slug: str) -> int:
         if not text:
             f.unlink()
             continue
+        if _REPLAN_RE.match(text):
+            body = _REPLAN_RE.sub("", text, count=1).strip()
+            if not body:
+                f.unlink()
+                continue
+            try:
+                result = dump(conn, slug, body)
+            except Exception as e:
+                # Leave the file; the next pass retries. Losing enriched
+                # context because one LLM call failed is the worse outcome.
+                print(f"[replan] {slug}: {type(e).__name__}: {e}", flush=True)
+                continue
+            log_event(slug, f"**replanned** from `{f.name}` — "
+                            f"{result.get('created', 0)} new, "
+                            f"{result.get('refactored', {})}")
+            f.rename(archive / f.name)
+            count += 1
+            continue
+
         if apply_directive(conn, text) is not None:
             f.rename(archive / f.name)          # handled; never becomes a task
             count += 1

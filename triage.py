@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import board
@@ -51,6 +52,66 @@ Consequence means what happens if this is never done:
   improves  genuinely better if done, nothing bad if not
   optional  would be nice
 """
+
+
+# P0..P3 at the head of a capture. Parsed here rather than asked of the model:
+# the pattern is rigid, and a free-tier model that silently drops it produces a
+# task that looks fine and is ranked wrong. Stripping it also removes one piece
+# of scaffolding from the title before triage ever sees the text.
+_PRIORITY_RE = re.compile(r"^\s*p\s*([0-3])\b[\s:.,;\-\u2013\u2014]*", re.IGNORECASE)
+
+# P0 is not a consequence, it is an override -- see store.PINNED_SCORE.
+_PRIORITY_CONSEQUENCE = {1: "breaks", 2: "costs", 3: "improves"}
+
+
+# Leading scaffolding, stripped in Python. The prompt asks the model to do this
+# too, but a free-tier model ignored the instruction on the very first try and
+# returned the whole sentence -- and an unreliable rule that silently no-ops is
+# worse than no rule. Anchored at the start and applied repeatedly, so only a
+# prefix is ever removed: nothing in the middle of a sentence is touched.
+_SCAFFOLD_RES = [re.compile(p, re.IGNORECASE) for p in (
+    r"^(?:this\s+is\s+)?(?:my\s+)?work(?:\s+at\s+meta)?\s*[.,;:\-]+\s*",
+    r"^(?:for\s+)?work\s*[:\-]\s*",
+    r"^w\s*[:\-]\s*",
+    r"^(?:i\s+)?(?:need|have|want)\s+to\s+",
+    r"^(?:i\s+)?should\s+",
+    r"^(?:please\s+)?remember\s+to\s+",
+    r"^todo\s*[:\-]?\s*",
+)]
+
+
+# The routing phrase IS the meta signal. Stripping it in Python removed the
+# only evidence the model had, and a P0 work item came back as track "flow".
+# Detect it before removing it, and force the track rather than hoping.
+_WORK_SIGNAL = re.compile(
+    r"^\s*(?:this\s+is\s+)?(?:my\s+)?work(?:\s+at\s+meta)?\b|^\s*(?:for\s+)?work\s*[:\-]|^\s*w\s*[:\-]",
+    re.IGNORECASE)
+
+
+def looks_like_work(text: str) -> bool:
+    """True if the capture opened with a work/meta routing marker."""
+    return bool(_WORK_SIGNAL.match(text or ""))
+
+
+def strip_scaffolding(text: str) -> str:
+    """Remove leading routing phrases and filler. Never substitutes a word."""
+    out = (text or "").strip()
+    changed = True
+    while changed and out:
+        changed = False
+        for rx in _SCAFFOLD_RES:
+            new = rx.sub("", out, count=1)
+            if new != out:
+                out, changed = new.strip(), True
+    return out or (text or "").strip()
+
+
+def split_priority(text: str) -> tuple[int | None, str]:
+    """Pull a leading P0..P3 off a capture. Returns (level, remaining text)."""
+    m = _PRIORITY_RE.match(text or "")
+    if not m:
+        return None, (text or "").strip()
+    return int(m.group(1)), (text or "")[m.end():].strip()
 
 
 def ingest_inbox(conn) -> int:
@@ -101,6 +162,14 @@ def rescore(conn, cfg: dict | None = None) -> int:
     tolerances = cfg.get("tolerance_days", {})
     now = datetime.now()
     for row in store.active_tasks(conn):
+        pin = row["pinned_until"]
+        if pin:
+            try:
+                if datetime.fromisoformat(pin) > now:
+                    store.set_score(conn, row["id"], scoring.PINNED_SCORE)
+                    continue
+            except (TypeError, ValueError):
+                pass
         value = scoring.score(
             track=row["track"], consequence=row["consequence"], due=row["due"],
             age_days=store.age_days(row, now), tolerance_days=tolerances.get(row["track"]),
@@ -177,6 +246,16 @@ def run(conn, limit: int = 25) -> dict:
         summary["from_siri"] = len(board.drain_inbox(conn))
         summary["ingested"] = ingest_inbox(conn)
         captures = [dict(r) for r in store.pending_captures(conn, limit)]
+        # Strip P0..P3 before the model sees the text, and remember the level.
+        levels: dict[str, int] = {}
+        work: set[str] = set()
+        for c in captures:
+            lvl, stripped = split_priority(c["text"])
+            if lvl is not None:
+                levels[c["id"]] = lvl
+            if looks_like_work(stripped):
+                work.add(c["id"])
+            c["text"] = strip_scaffolding(stripped) or c["text"]
         if not captures:
             rescore_and_sync(conn, summary)
             import escalate
@@ -205,6 +284,27 @@ def run(conn, limit: int = 25) -> dict:
                 continue
             task_id = store.create_task(conn, **item)
             store.mark_capture(conn, item["capture_id"], "done", task_id)
+
+            # What you typed wins over whatever the model inferred.
+            if item["capture_id"] in work:
+                conn.execute("UPDATE tasks SET track='meta' WHERE id=?", (task_id,))
+            lvl = levels.get(item["capture_id"])
+            if lvl == 0:
+                pin = (datetime.now() + timedelta(days=365)).isoformat(timespec="seconds")
+                conn.execute(
+                    "UPDATE tasks SET consequence='breaks', pinned_until=? WHERE id=?",
+                    (pin, task_id))
+                summary["pinned"] = summary.get("pinned", 0) + 1
+            elif lvl is not None:
+                conn.execute("UPDATE tasks SET consequence=? WHERE id=?",
+                             (_PRIORITY_CONSEQUENCE[lvl], task_id))
+
+            if item.get("project"):
+                import project
+                project.log_event(
+                    item["project"],
+                    f"**captured** `{task_id}`"
+                    f"{f' (P{lvl})' if lvl is not None else ''} — {item['title']}")
             # Deliberately NOT written to the board here -- see rescore_and_sync.
             summary["triaged"] += 1
 
