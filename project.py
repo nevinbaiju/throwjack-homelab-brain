@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import board
@@ -286,6 +286,69 @@ whose first step is not obvious does not get started.
                    "due": r["due"], "seq": r["seq"]} for r in rows],
     }, indent=2), encoding="utf-8")
     return root
+
+
+def promote(conn, cfg: dict | None = None) -> dict:
+    """Refill each project's In Progress from its backlog, and announce the move.
+
+    Nothing promoted a task after creation: FOCUS_CAP was consulted once, at
+    plan time, so when In Progress emptied the backlog just sat there. This is
+    the refill.
+
+    Gated on policy.can_notify for the task's own track, so nothing moves or
+    buzzes during downtime -- waking up to three tasks that silently started
+    overnight is worse than waking up to none.
+
+    The alarm is set explicitly rather than via alarm_time_for(), which returns
+    None for a task with no due date. The point here is to announce the move,
+    which has nothing to do with whether a deadline exists.
+    """
+    cfg = cfg or policy.load_config()
+    now = datetime.now()
+    out: dict = {"promoted": 0, "held": 0, "titles": []}
+
+    slugs = [r["project"] for r in conn.execute(
+        "SELECT DISTINCT project FROM tasks "
+        "WHERE archived=0 AND status!='completed' AND project IS NOT NULL AND project!=''")]
+
+    for slug in slugs:
+        room = FOCUS_CAP - store.in_progress_count(conn, slug)
+        if room <= 0:
+            continue
+        candidates = conn.execute(
+            "SELECT * FROM tasks WHERE archived=0 AND status!='completed' "
+            "AND project=? AND lane='backlog' ORDER BY seq, score DESC", (slug,)).fetchall()
+        for row in candidates:
+            if room <= 0:
+                break
+            if not policy.can_notify(row["track"], now, cfg):
+                out["held"] += 1
+                continue
+            ts = store.now_iso()
+            # A promotion is a fresh nudge, not a continuation of an old
+            # escalation chain: reset the counter and own last_alarm_at
+            # outright, because write_task only sets it when it is NULL.
+            #
+            # The alarm is a minute out, not "now": escalate_tasks re-arms
+            # anything whose last_alarm_at has already passed, and running in
+            # the same pass it would push this to +2h before the phone ever
+            # saw it.
+            announce = now + timedelta(minutes=1)
+            conn.execute(
+                "UPDATE tasks SET lane='in_progress', touched_at=?, updated_at=?, "
+                "escalations=0, last_alarm_at=? WHERE id=?",
+                (ts, ts, announce.isoformat(timespec="seconds"), row["id"]))
+            fresh = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
+            try:
+                board.write_task(conn, fresh, alarm_at=announce)
+                out["promoted"] += 1
+                out["titles"].append(fresh["title"])
+                room -= 1
+            except caldav.CalDavError as e:
+                # Put it back: a lane change the phone never saw is a lie.
+                conn.execute("UPDATE tasks SET lane='backlog' WHERE id=?", (row["id"],))
+                print(f"[promote] {row['id']} rolled back: {e}", flush=True)
+    return out
 
 
 def ingest_all_captures_by_project(conn) -> dict[str, int]:

@@ -122,6 +122,16 @@ def reorder_lanes(conn) -> dict[str, int]:
     return {}
 
 
+def _promote(conn) -> dict:
+    """Refill In Progress. Local import: project imports triage, not the reverse."""
+    import project
+    try:
+        return project.promote(conn)
+    except Exception as e:
+        print(f"[triage] promote failed: {type(e).__name__}: {e}", flush=True)
+        return {"promoted": 0, "held": 0, "error": str(e)}
+
+
 def rescore_and_sync(conn, summary: dict | None = None) -> dict:
     """Rescore every active task, then push the ones whose PRIORITY bucket moved.
 
@@ -159,7 +169,8 @@ def rescore_and_sync(conn, summary: dict | None = None) -> dict:
 def run(conn, limit: int = 25) -> dict:
     run_id = store.start_run(conn, "triage")
     summary = {"reconciled": {}, "from_siri": 0, "ingested": 0, "triaged": 0,
-               "duplicates": 0, "failed": 0, "carded": 0, "repriced": 0}
+               "duplicates": 0, "failed": 0, "carded": 0, "repriced": 0,
+               "promoted": {}}
     try:
         board.bootstrap()
         summary["reconciled"] = reconcile(conn)
@@ -170,6 +181,7 @@ def run(conn, limit: int = 25) -> dict:
             rescore_and_sync(conn, summary)
             import escalate
             summary["escalated"] = escalate.run(conn)
+            summary["promoted"] = _promote(conn)
             store.finish_run(conn, run_id, True, json.dumps(summary))
             return summary
 
@@ -206,6 +218,7 @@ def run(conn, limit: int = 25) -> dict:
         rescore_and_sync(conn, summary)
         import escalate
         summary["escalated"] = escalate.run(conn)
+        summary["promoted"] = _promote(conn)
         sync_rollups(conn)
         reorder_lanes(conn)
         store.finish_run(conn, run_id, True, json.dumps(summary))

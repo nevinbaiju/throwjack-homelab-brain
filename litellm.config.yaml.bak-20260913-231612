@@ -37,21 +37,6 @@ model_list:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
 
-  # --- chess-coach: narrates already-computed chess facts for the chess
-  # trainer. Short prose, a handful of calls per game review. Never asked to
-  # evaluate a position — Stockfish does that — so raw reasoning ability
-  # matters less here than clear writing. NOTE: both of these are reasoning
-  # models and spend part of max_tokens thinking before emitting any content,
-  # which is why the caller asks for a generous budget. ---
-  - model_name: chess-coach
-    litellm_params:
-      model: groq/openai/gpt-oss-120b
-      api_key: os.environ/GROQ_API_KEY
-  - model_name: chess-coach-b1
-    litellm_params:
-      model: gemini/gemini-3.6-flash
-      api_key: os.environ/GEMINI_API_KEY
-
 router_settings:
   # Measured: 2 of 5 providers failed transiently in one test run (429, 503).
   # The chain is the whole reason a free tier is usable here.
@@ -59,7 +44,6 @@ router_settings:
     - brain-fast: [brain-fast-b1, brain-fast-b2]
     - brain-long: [brain-long-b1]
     - brain-plan: [brain-plan-b1]
-    - chess-coach: [chess-coach-b1]
   num_retries: 2
   timeout: 120
 
