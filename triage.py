@@ -88,7 +88,7 @@ def project_to_board(conn, task_id: str) -> None:
     if row is None:
         return
     cfg = policy.load_config()
-    board.write_task(conn, row, alarm_at=board.alarm_time_for(row, cfg))
+    board.write_task(conn, row, alarm_at=board.intended_alarm(row, cfg))
 
 
 def reconcile(conn) -> dict:

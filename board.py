@@ -181,12 +181,34 @@ def audit(conn) -> list[dict]:
             bad["priority"] = {"want": want_pri, "got": card.get("priority")}
         if card.get("lane") != want_lane:
             bad["lane"] = {"want": want_lane, "got": card.get("lane")}
-        want_alarm = alarm_time_for(row) is not None
+        want_alarm = intended_alarm(row) is not None
         if bool(card.get("has_alarm")) != want_alarm:
             bad["alarm"] = {"want": want_alarm, "got": bool(card.get("has_alarm"))}
         if bad:
             out.append({"id": tid, "summary": row["title"], "problem": "stale card", "diff": bad})
     return out
+
+
+def intended_alarm(row, cfg: dict | None = None) -> datetime | None:
+    """The alarm this card SHOULD carry.
+
+    alarm_time_for() only knows about deadlines, so it returns None for a task
+    with no due date. But promotion and escalation both place alarms
+    deliberately and record them in last_alarm_at. Re-pushing a card from
+    alarm_time_for() alone therefore strips those -- which silently undoes a
+    promotion announcement. Everything that writes or audits a card must agree
+    on this one answer.
+    """
+    at = alarm_time_for(row, cfg)
+    if at is not None:
+        return at
+    raw = row["last_alarm_at"]
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def reconcile(conn) -> dict:

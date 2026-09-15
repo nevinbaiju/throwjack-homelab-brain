@@ -32,7 +32,9 @@ Return ONLY a JSON object, no prose, no markdown fence:
   "tasks":    [{"title": "...", "why": "...", "consequence": "breaks|costs|improves|optional",
                 "estimate_min": 45, "due": "YYYY-MM-DD or null", "seq": 1,
                 "start_now": true}],
-  "open_questions": ["things the user must decide that you cannot"]
+  "open_questions": ["things the user must decide that you cannot"],
+  "updates":  [{"id": "t_abc123def456", "title": "...", "why": "...", "seq": 2,
+                "consequence": "...", "estimate_min": 30, "due": "...", "drop": false}]
 }
 
 Rules for tasks:
@@ -51,7 +53,22 @@ Rules for tasks:
   user said is the worst failure here.
 - Do NOT invent scope the user did not mention.
 
-If existing tasks are listed, do not duplicate them. Only return NEW tasks.
+Existing tasks are listed with their ids. Do not duplicate them as new tasks.
+
+"updates" REFRAMES work that already exists. Use it when newer context shows
+an existing task is vague, misordered, wrongly scoped or no longer needed.
+This is the point of the field: the plan was often written from a thinner
+dump than you are holding now, and a task the user cannot start is worse
+than no task.
+
+- Include "id" plus ONLY the fields you are changing. Omit the rest.
+- Retitle when the title is not a concrete physical next action.
+- Reorder with "seq" when the sequence no longer reflects what unblocks what.
+- "drop": true archives a task the newer context has made irrelevant. Use it
+  sparingly and never for something merely inconvenient.
+- Leave a task alone if you would only be rewording it. Churn costs the user
+  a re-read of a card they already recognise.
+- An id you were not given does not exist. Never invent one.
 """
 
 
@@ -70,9 +87,11 @@ def _user_message(slug: str, dump: str, existing) -> str:
     lines = [f"Today is {datetime.now().strftime('%Y-%m-%d (%A)')}.",
              f"Project slug: {slug}", ""]
     if existing:
-        lines.append("Tasks that ALREADY exist — do not repeat these:")
+        lines.append("Tasks that ALREADY exist. Do not repeat them as new; "
+                     "refactor them through \"updates\" if newer context warrants it:")
         for row in existing:
-            lines.append(f'  - [{row["status"]}] {row["title"]}')
+            seq = row["seq"] if "seq" in row.keys() else ""
+            lines.append(f'  - {row["id"]} [{row["status"]}] (seq {seq}) {row["title"]}')
         lines.append("")
     lines += ["The dump:", '"""', dump.strip(), '"""']
     return "\n".join(lines)
@@ -82,8 +101,8 @@ def validate_plan(raw: str) -> dict:
     data = llm._loads(raw)
     proj = data.get("project") or {}
     tasks_in = data.get("tasks")
-    if not isinstance(tasks_in, list) or not tasks_in:
-        raise llm.LLMError("plan has no tasks")
+    if not isinstance(tasks_in, list):
+        tasks_in = []
 
     tasks, started = [], 0
     for n, t in enumerate(tasks_in):
@@ -114,8 +133,8 @@ def validate_plan(raw: str) -> dict:
                       "consequence": cons, "estimate_min": est, "due": due,
                       "seq": seq, "start_now": start})
 
-    if not tasks:
-        raise llm.LLMError("no usable tasks in plan")
+    # Emptiness is checked after updates are parsed: a dump whose whole point
+    # is reframing existing work is valid and returns no new tasks at all.
 
     questions = [str(q).strip()[:300] for q in (data.get("open_questions") or [])
                  if str(q).strip()][:10]
@@ -123,10 +142,43 @@ def validate_plan(raw: str) -> dict:
     if not (isinstance(deadline, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", deadline)):
         deadline = None
 
+    # Updates carry only the fields the model chose to change, so each is
+    # validated on its own and absent keys stay absent -- writing a default
+    # here would silently overwrite good data with a guess.
+    updates = []
+    for u in (data.get("updates") or []):
+        if not isinstance(u, dict):
+            continue
+        tid = str(u.get("id") or "").strip()
+        if not re.fullmatch(r"t_[0-9a-f]{6,}", tid):
+            continue
+        fields: dict = {}
+        if isinstance(u.get("title"), str) and u["title"].strip():
+            fields["title"] = u["title"].strip()[:255]
+        if isinstance(u.get("why"), str) and u["why"].strip():
+            fields["why"] = u["why"].strip()[:300]
+        if isinstance(u.get("seq"), int) and not isinstance(u.get("seq"), bool):
+            fields["seq"] = u["seq"]
+        c = str(u.get("consequence", "")).lower().strip()
+        if c in llm.CONSEQUENCES:
+            fields["consequence"] = c
+        if u.get("estimate_min") is not None:
+            fields["estimate_min"] = llm.coerce_minutes(u["estimate_min"])
+        d = u.get("due")
+        if isinstance(d, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", d):
+            fields["due"] = d
+        if u.get("drop") is True:
+            fields = {"drop": True}
+        if fields:
+            updates.append({"id": tid, **fields})
+
+    if not tasks and not updates:
+        raise llm.LLMError("plan has neither tasks nor updates")
+
     return {"name": str(proj.get("name") or "").strip()[:120],
             "summary": str(proj.get("summary") or "").strip()[:1000],
             "deadline": deadline, "tasks": sorted(tasks, key=lambda t: t["seq"]),
-            "open_questions": questions}
+            "open_questions": questions, "updates": updates}
 
 
 def dump(conn, slug: str, text: str, alias: str = "brain-plan") -> dict:
@@ -175,6 +227,8 @@ def dump(conn, slug: str, text: str, alias: str = "brain-plan") -> dict:
             triage.project_to_board(conn, task_id)
             summary["created"] += 1
 
+        summary["refactored"] = apply_updates(conn, slug, plan.get("updates") or [])
+
         triage.rescore(conn)
         write_context(conn, slug)
         store.finish_run(conn, run_id, True, json.dumps(summary))
@@ -182,6 +236,50 @@ def dump(conn, slug: str, text: str, alias: str = "brain-plan") -> dict:
     except Exception as e:
         store.finish_run(conn, run_id, False, f"{type(e).__name__}: {e}")
         raise
+
+
+def apply_updates(conn, slug: str, updates: list[dict]) -> dict:
+    """Apply the planner's refactors to tasks that already exist.
+
+    Scoped to this project: an id from another project, or one the model
+    invented, is ignored rather than guessed at. Only the fields present in an
+    update are written, so a partial update cannot blank good data.
+    """
+    out = {"retitled": 0, "reordered": 0, "rescoped": 0, "dropped": 0, "ignored": 0}
+    for u in updates:
+        row = conn.execute(
+            "SELECT * FROM tasks WHERE id=? AND project=? AND archived=0",
+            (u["id"], slug)).fetchone()
+        if row is None:
+            out["ignored"] += 1
+            continue
+
+        if u.get("drop"):
+            conn.execute("UPDATE tasks SET archived=1, updated_at=? WHERE id=?",
+                         (store.now_iso(), u["id"]))
+            try:
+                board.remove_task(conn, row)
+            except caldav.CalDavError as e:
+                print(f"[refactor] {u['id']} card not removed: {e}", flush=True)
+            out["dropped"] += 1
+            continue
+
+        sets, vals = [], []
+        for col in ("title", "why", "seq", "consequence", "estimate_min", "due"):
+            if col in u and u[col] != row[col]:
+                sets.append(f"{col}=?")
+                vals.append(u[col])
+                out["retitled" if col == "title" else
+                    "reordered" if col == "seq" else "rescoped"] += 1
+        if not sets:
+            continue
+        vals += [store.now_iso(), u["id"]]
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)}, updated_at=? WHERE id=?", vals)
+        try:
+            triage.project_to_board(conn, u["id"])
+        except caldav.CalDavError as e:
+            print(f"[refactor] {u['id']} board update failed: {e}", flush=True)
+    return out
 
 
 def write_context(conn, slug: str) -> Path:
@@ -242,6 +340,31 @@ The current state of the work is imported above — do not re-plan anything it
 already lists as in progress or done. `tasks.json` has the same data with task
 ids and status if you need it; read it only when you need the ids.
 
+## Start by asking him about the project
+
+Do this once, near the start of a session, before doing the work.
+
+The plan above was written by a small free-tier model from whatever he
+happened to dump at the time. It has no access to the code, the repo, or
+anything he did not think to type. You do. So the task titles are often
+vaguer than they should be, the ordering often does not reflect what actually
+unblocks what, and some tasks are scoped wrong.
+
+Ask him the questions that would change the plan. Not a questionnaire — two
+or three real ones, the things you would need to know to do the work well and
+cannot find out yourself. Constraints, what he has already decided, what
+"done" looks like, what he is actually worried about.
+
+Then write what you learned into `dumps/` as a new markdown file and tell him
+to run `./brain.sh dump {slug}` — or write it as a capture and let the timer
+take it. The brain re-plans against the tasks that already exist: it can
+retitle a vague task, reorder the sequence, rescope an estimate, or drop work
+the new context has made irrelevant. That is the mechanism by which your
+understanding improves his board.
+
+You cannot edit tasks directly, and should not try. Improve the context and
+the tasks follow.
+
 ## To close or move a task you worked on
 
 Write a capture whose FIRST line is a directive, using the id from tasks.json:
@@ -258,8 +381,8 @@ Write a NEW markdown file into `captures/`, one item per file:
 
     captures/{datetime.now():%Y-%m-%d}-short-slug.md
 
-Plain prose is enough — one sentence. These are picked up when Nevin runs a
-sync, turned into items on his task lists, and the file is moved to
+Plain prose is enough — one sentence. The brain sweeps these on a timer,
+turns them into items on his task lists, and moves the file to
 `captures/.ingested/`. Do not batch unrelated items into one file.
 
 Good: "The Nyquist plots in problem set 4 need redoing before Thursday."
