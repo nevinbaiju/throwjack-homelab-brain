@@ -21,6 +21,10 @@ import store
 import triage
 
 CONTEXTS = store.BRAIN_ROOT / "contexts"
+
+# Shipped with the code, rendered into CONTEXTS at runtime. See
+# ensure_root_context().
+ROOT_CONTEXT_SRC = Path(__file__).with_name("contexts")
 FOCUS_CAP = 3
 
 SYSTEM = """You turn a raw brain-dump about one project into a concrete plan.
@@ -288,8 +292,42 @@ def apply_updates(conn, slug: str, updates: list[dict]) -> dict:
     return out
 
 
+def ensure_root_context() -> list[str]:
+    """Render the shared agent contract into contexts/.
+
+    AGENTS.md and CLAUDE.md at the root of contexts/ are what EVERY project
+    inherits -- Claude Code reads CLAUDE.md from the working directory and every
+    parent, and the root CLAUDE.md imports AGENTS.md. They carry the directive
+    vocabulary, the replan instruction and the "ask him first" contract.
+
+    They used to live only on the storage volume: no git history, no diff, and
+    nothing at all for anyone who cloned the repo -- their agents would have
+    started with no contract. They are part of the code now.
+
+    Overwritten rather than merged, deliberately: edit them in the repo, not on
+    the volume, or the next pass will discard your change.
+    """
+    written = []
+    CONTEXTS.mkdir(parents=True, exist_ok=True)
+    for name in ("AGENTS.md", "CLAUDE.md"):
+        src = ROOT_CONTEXT_SRC / name
+        if not src.is_file():
+            continue
+        text = src.read_text(encoding="utf-8")
+        dst = CONTEXTS / name
+        try:
+            if dst.is_file() and dst.read_text(encoding="utf-8") == text:
+                continue
+        except OSError:
+            pass
+        dst.write_text(text, encoding="utf-8")
+        written.append(name)
+    return written
+
+
 def write_context(conn, slug: str) -> Path:
     """Refresh contexts/<slug>/ so another LLM can pick the project up cold."""
+    ensure_root_context()
     root = CONTEXTS / slug
     (root / "captures").mkdir(parents=True, exist_ok=True)
     proj = store.get_project(conn, slug)

@@ -105,6 +105,16 @@ def _triage_loop(stop: threading.Event) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Render the shared agent contract before anything else: a fresh install
+    # has no projects yet, so write_context() would not have run.
+    try:
+        import project
+        rendered = project.ensure_root_context()
+        if rendered:
+            print(f"[brain] contexts/ contract rendered: {', '.join(rendered)}", flush=True)
+    except Exception as e:
+        print(f"[brain] contract render failed: {type(e).__name__}: {e}", flush=True)
+
     stop = threading.Event()
     worker = threading.Thread(target=_triage_loop, args=(stop,), daemon=True)
     worker.start()
