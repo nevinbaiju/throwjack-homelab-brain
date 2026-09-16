@@ -19,10 +19,27 @@ from pathlib import Path
 
 import yaml
 
-import caldav
 import board
+import caldav
+import store
 
-CHORES_FILE = Path(__file__).with_name("upkeep.yaml")
+# Shipped with the image, but edited at runtime once cadence became editable
+# from the UI -- so the live copy lives on the mounted volume. /app is baked
+# into the image and a rebuild would silently discard every change.
+PACKAGED_CHORES = Path(__file__).with_name("upkeep.yaml")
+CHORES_FILE = store.BRAIN_ROOT / "upkeep.yaml"
+
+
+def ensure_chores_file() -> Path:
+    """Seed the volume copy from the packaged one, once. Never overwrites."""
+    try:
+        if not CHORES_FILE.exists() and PACKAGED_CHORES.exists():
+            CHORES_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CHORES_FILE.write_text(PACKAGED_CHORES.read_text(encoding="utf-8"),
+                                   encoding="utf-8")
+    except OSError as e:
+        print(f"[upkeep] could not seed {CHORES_FILE}: {e}", flush=True)
+    return CHORES_FILE if CHORES_FILE.exists() else PACKAGED_CHORES
 UID_PREFIX = "u_"          # never t_, so nothing mistakes one for a task
 
 WEEKDAYS = {"monday": ("MO", 0), "tuesday": ("TU", 1), "wednesday": ("WE", 2),
@@ -137,7 +154,7 @@ def build(chore: dict) -> tuple[str, str]:
 
 
 def load(path: Path | None = None) -> list[dict]:
-    path = path or CHORES_FILE
+    path = path or ensure_chores_file()
     data = yaml.safe_load(path.read_text()) or {}
     chores = data.get("chores")
     if not isinstance(chores, list) or not chores:

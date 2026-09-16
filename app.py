@@ -441,9 +441,31 @@ async def task_state(task_id: str, verb: str,
         conn.close()
 
 
+SHOP_PREFIX = "shop-"
+
+
 def _shop_collections() -> dict[str, str]:
-    import board as bd
-    return {c: label for c, label in bd.SHOPPING}
+    """Live shopping collections, discovered rather than hardcoded."""
+    import caldav
+    return {c["collection"]: c["label"] for c in caldav.list_collections()
+            if c["collection"].startswith(SHOP_PREFIX)}
+
+
+def _chore_cadence() -> dict[str, dict]:
+    """{uid: {repeat, at, day}} from upkeep.yaml, keyed the way the VTODOs are."""
+    import upkeep
+    try:
+        chores = upkeep.load()
+    except Exception as e:
+        print(f"[lists] upkeep.load: {type(e).__name__}: {e}", flush=True)
+        return {}
+    out = {}
+    for c in chores:
+        uid = upkeep.UID_PREFIX + upkeep._slug(c.get("title", ""))
+        out[uid] = {"repeat": c.get("repeat", "daily"), "at": c.get("at", ""),
+                    "day": upkeep.weekday_of(c) or "", "title": c.get("title", ""),
+                    "essential": bool(c.get("essential"))}
+    return out
 
 
 @app.get("/lists.json")
@@ -453,73 +475,119 @@ async def lists_json(authorization: str | None = Header(default=None),
 
     Neither lives in SQLite. Upkeep items are VTODOs the brain writes with an
     RRULE and iOS owns thereafter; the shop-* collections the brain never
-    touches at all -- they are yours, and this only reads them.
+    touches except through this page.
+
+    Completed items are dropped, not shown struck through: a shopping list you
+    have to scroll past yesterday's shopping to read is worse than one that
+    just gets shorter.
     """
     _require_auth(authorization, session)
     import caldav, board as bd
 
-    def read(coll):
+    def live(coll):
         try:
             return [{"uid": x["uid"], "summary": x["summary"],
-                     "description": x.get("description") or "",
-                     "done": x["status"] == "COMPLETED", "due": x.get("due")}
-                    for x in caldav.list_todos(coll)]
+                     "description": x.get("description") or ""}
+                    for x in caldav.list_todos(coll) if x["status"] != "COMPLETED"]
         except caldav.CalDavError as e:
             print(f"[lists] {coll}: {e}", flush=True)
             return []
 
-    upkeep = sorted(read(bd.LANES["upkeep"][0]), key=lambda i: (i["done"], i["summary"].lower()))
-    shops = []
-    for coll, label in bd.SHOPPING:
-        items = sorted(read(coll), key=lambda i: (i["done"], i["summary"].lower()))
-        shops.append({"collection": coll, "label": label, "items": items})
-    return {"upkeep": upkeep, "shopping": shops}
+    cadence = _chore_cadence()
+    upkeep_items = []
+    for i in sorted(live(bd.LANES["upkeep"][0]), key=lambda i: i["summary"].lower()):
+        i["cadence"] = cadence.get(i["uid"])           # None for ones you added on the phone
+        upkeep_items.append(i)
+
+    shops = [{"collection": c, "label": label,
+              "items": sorted(live(c), key=lambda i: i["summary"].lower())}
+             for c, label in sorted(_shop_collections().items(), key=lambda kv: kv[1].lower())]
+    return {"upkeep": upkeep_items, "shopping": shops}
 
 
-@app.post("/list/{collection}/add")
-async def list_add(collection: str, request: Request,
+@app.post("/lists/add")
+async def lists_add(request: Request,
         authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Add one item to a shopping list. Shopping only -- upkeep is generated."""
+    """Create a new shopping list. The name becomes its display name."""
     _require_auth(authorization, session)
-    import caldav
-    if collection not in _shop_collections():
-        raise HTTPException(status_code=400, detail="not a shopping list")
-    text, _ = await _extract_text(request)
-    text = text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="empty item")
-    uid = f"g_{uuid.uuid4().hex[:12]}"
-    caldav.put_todo(collection, uid, caldav.build_vtodo(uid, text[:255]))
-    return {"ok": True, "uid": uid}
+    import caldav, project
+    name, _ = await _extract_text(request)
+    name = name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="empty name")
+    slug = project.slugify(name)
+    if not slug:
+        raise HTTPException(status_code=400, detail="name has no usable characters")
+    coll = SHOP_PREFIX + slug
+    caldav.ensure_collection(coll, name[:60])
+    return {"ok": True, "collection": coll, "label": name[:60]}
 
 
-@app.post("/list/{collection}/{uid}/done")
-async def list_done(collection: str, uid: str,
+@app.delete("/lists/{collection}")
+async def lists_delete(collection: str,
         authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Tick a shopping item off.
+    """Delete a shopping list and everything in it. Shopping only, no undo."""
+    _require_auth(authorization, session)
+    import caldav, board as bd
+    if not collection.startswith(SHOP_PREFIX) or collection in bd.BRAIN_OWNED:
+        raise HTTPException(status_code=400, detail="not a shopping list")
+    caldav.delete_collection(collection)
+    return {"ok": True, "collection": collection}
 
-    Shopping only. Upkeep items carry an RRULE and iOS owns the recurrence --
-    completing one from here risks closing the series instead of the occurrence,
-    so that tab stays read-only.
 
-    Rewritten from summary + description rather than patched in place, because
-    get_todo returns a parsed dict, not the raw ICS. If-Match means a change
-    made on the phone since we read it wins instead of being clobbered.
+@app.post("/upkeep/{uid}/cadence")
+async def upkeep_cadence(uid: str, request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Change one chore's cadence, then re-sync the Upkeep list.
+
+    Writes upkeep.yaml on the volume, not the copy baked into the image, and
+    rewrites only the fields given. The header comments are preserved verbatim
+    and only the chores list below them is regenerated.
     """
     _require_auth(authorization, session)
-    import caldav
-    if collection not in _shop_collections():
-        raise HTTPException(status_code=400, detail="not a shopping list")
-    current = [x for x in caldav.list_todos(collection) if x["uid"] == uid]
-    if not current:
-        raise HTTPException(status_code=404, detail="no such item")
-    item = current[0]
-    ics = caldav.build_vtodo(uid, item["summary"],
-                             description=item.get("description") or "", completed=True)
-    caldav.put_todo(collection, uid, ics, etag=item.get("etag"))
-    return {"ok": True, "uid": uid}
+    import upkeep, yaml as _yaml
+    payload = await request.json()
+    repeat = str(payload.get("repeat", "")).strip()
+    at = str(payload.get("at", "")).strip()
+    day = str(payload.get("day", "")).strip().lower()
+    if not repeat:
+        raise HTTPException(status_code=400, detail="repeat is required")
+
+    path = upkeep.ensure_chores_file()
+    data = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    chores = data.get("chores") or []
+    target = None
+    for c in chores:
+        if upkeep.UID_PREFIX + upkeep._slug(c.get("title", "")) == uid:
+            target = c
+            break
+    if target is None:
+        raise HTTPException(status_code=404, detail="no such chore in upkeep.yaml")
+
+    target["repeat"] = repeat
+    if at:
+        target["at"] = at
+    if day:
+        target["day"] = day
+    elif "day" in target and not repeat.startswith("weekly"):
+        target.pop("day", None)
+
+    try:
+        upkeep.parse_repeat(repeat, upkeep.weekday_of(target))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"unusable cadence: {e}")
+
+    # Keep the header comments -- they explain the `day` vs `on` YAML trap and
+    # that quiet hours do not apply here -- and regenerate only the list below
+    # it. Verified there are no comments inside the chores block itself.
+    header = path.read_text(encoding="utf-8").split("chores:")[0]
+    path.write_text(header + _yaml.safe_dump({"chores": chores}, sort_keys=False,
+                                             allow_unicode=True), encoding="utf-8")
+    result = upkeep.sync()
+    return {"ok": True, "uid": uid, "repeat": repeat, "synced": result}
 
 
 @app.post("/repush")

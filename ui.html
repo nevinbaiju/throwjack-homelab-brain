@@ -112,6 +112,21 @@
     background:var(--accent);color:var(--accent-ink)}
   #additem:focus-visible,#addto:focus-visible,#addbtn:focus-visible{
     outline:2px solid var(--signal);outline-offset:2px}
+  .lane h2 .kill{margin-left:auto;font-family:var(--mono);font-size:11px;padding:2px 7px;
+    cursor:pointer;background:transparent;color:var(--ink-3);border:1px solid var(--rule);
+    border-radius:5px}
+  .lane h2 .kill:hover{color:var(--signal);border-color:var(--signal)}
+  .cad{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px}
+  .cad button{font-family:var(--mono);font-size:10.5px;margin-left:8px;padding:2px 6px;
+    cursor:pointer;background:var(--raise);color:var(--ink-2);
+    border:1px solid var(--rule);border-radius:5px}
+  .cadedit{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;align-items:center}
+  .cadedit input,.cadedit select{font-family:var(--mono);font-size:12px;padding:5px 7px;
+    background:var(--surface);color:var(--ink);border:1px solid var(--rule);border-radius:6px}
+  .cadedit input.rep{flex:1;min-width:120px}
+  .cadedit .save{background:var(--accent);color:var(--accent-ink);border:0;cursor:pointer;
+    font-family:var(--cond);font-weight:700;font-size:11px;letter-spacing:.06em;
+    text-transform:uppercase;padding:6px 12px;border-radius:6px}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 
@@ -225,6 +240,27 @@ async function act(id, verb, li){
 
 let SHOPS = [];
 
+function cadenceText(c){
+  if (!c) return 'added on the phone — cadence lives in Reminders';
+  return c.repeat + (c.at ? ' at ' + c.at : '') + (c.day ? ' · ' + c.day : '');
+}
+
+const DAYS = ['','monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+
+async function saveCadence(uid, li){
+  const repeat = li.querySelector('.rep').value.trim();
+  const at = li.querySelector('.at').value.trim();
+  const day = li.querySelector('.day').value;
+  if (!repeat) return say('repeat cannot be empty', true);
+  try{
+    const r = await fetch('/upkeep/' + encodeURIComponent(uid) + '/cadence',
+      {method:'POST', headers:{...H,'Content-Type':'application/json'},
+       body: JSON.stringify({repeat, at, day})});
+    if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.detail || r.status); }
+    say('cadence updated'); loadLists('upkeep');
+  }catch(e){ say('could not update — ' + e.message, true); }
+}
+
 async function loadLists(which){
   let data;
   try{
@@ -236,39 +272,50 @@ async function loadLists(which){
   const out = [];
   if (which === 'upkeep'){
     const items = data.upkeep || [];
-    // Read-only on purpose: these carry an RRULE and iOS owns the recurrence.
     out.push('<section class="lane"><h2>Upkeep<span class="n">' + items.length + '</span></h2><ul>');
-    if (!items.length) out.push('<li class="empty">nothing here</li>');
+    if (!items.length) out.push('<li class="empty">nothing due</li>');
     for (const i of items){
-      out.push('<li class="task' + (i.done ? ' done-row' : '') + '">' +
-        '<input class="tick" type="checkbox" disabled ' + (i.done ? 'checked' : '') + ' aria-label="' + esc(i.summary) + '">' +
+      const c = i.cadence;
+      out.push('<li class="task" data-uid="' + esc(i.uid) + '">' +
         '<div class="body"><div class="t">' + esc(i.summary) + '</div>' +
-        (i.description ? '<div class="meta">' + esc(i.description) + '</div>' : '') +
+        '<div class="cad">' + esc(cadenceText(c)) +
+          (c ? '<button data-edit="1">edit</button>' : '') + '</div>' +
+        (c ? '<div class="cadedit" hidden>' +
+              '<input class="rep" value="' + esc(c.repeat) + '" aria-label="repeat" ' +
+                'placeholder="daily · weekly · monthly · every 2 weeks">' +
+              '<input class="at" type="time" value="' + esc(c.at) + '" aria-label="time">' +
+              '<select class="day" aria-label="weekday">' +
+                DAYS.map(d => '<option value="' + d + '"' + (d === c.day ? ' selected' : '') + '>' +
+                              (d || 'any day') + '</option>').join('') +
+              '</select><button class="save">Save</button></div>' : '') +
         '</div></li>');
     }
-    out.push('</ul><p class="empty">recurring — tick these in Reminders, iOS owns the schedule</p></section>');
+    out.push('</ul><p class="empty">tick these off in Reminders — iOS owns the recurrence</p></section>');
   } else {
     SHOPS = (data.shopping || []).map(s => [s.collection, s.label]);
     $('addto').innerHTML = SHOPS.map(([c,l]) => '<option value="' + esc(c) + '">' + esc(l) + '</option>').join('');
     for (const shop of data.shopping || []){
-      const open = shop.items.filter(i => !i.done);
       out.push('<section class="lane" data-coll="' + esc(shop.collection) + '"><h2>' + esc(shop.label) +
-               '<span class="n">' + open.length + '</span></h2><ul>');
+               '<span class="n">' + shop.items.length + '</span>' +
+               '<button class="kill" title="delete this list">×</button></h2><ul>');
       if (!shop.items.length) out.push('<li class="empty">empty</li>');
       for (const i of shop.items){
-        out.push('<li class="task' + (i.done ? ' done-row' : '') + '" data-uid="' + esc(i.uid) + '">' +
-          '<input class="tick" type="checkbox" ' + (i.done ? 'checked disabled' : '') +
-            ' aria-label="tick off ' + esc(i.summary) + '">' +
+        out.push('<li class="task" data-uid="' + esc(i.uid) + '">' +
+          '<input class="tick" type="checkbox" aria-label="tick off ' + esc(i.summary) + '">' +
           '<div class="body"><div class="t">' + esc(i.summary) + '</div></div></li>');
       }
       out.push('</ul></section>');
     }
+    out.push('<section class="lane"><h2>New list</h2>' +
+             '<form id="newlist"><div class="cadedit">' +
+             '<input class="rep" id="newname" placeholder="Trader Joe\'s" aria-label="list name">' +
+             '<button class="save">Create</button></div></form></section>');
   }
   $('lists').innerHTML = out.join('');
 
-  $('lists').querySelectorAll('.task[data-uid]').forEach(li => {
-    const tick = li.querySelector('.tick');
-    if (!tick || tick.disabled) return;
+  // tick a grocery item off
+  $('lists').querySelectorAll('.task[data-uid] .tick').forEach(tick => {
+    const li = tick.closest('.task');
     const coll = li.closest('.lane').dataset.coll;
     tick.onchange = async () => {
       if (!tick.checked) return;
@@ -277,10 +324,45 @@ async function loadLists(which){
         const r = await fetch('/list/' + encodeURIComponent(coll) + '/' + encodeURIComponent(li.dataset.uid) + '/done',
                               {method:'POST', headers:H});
         if(!r.ok) throw new Error(r.status);
-        say('ticked off'); loadLists('shop');
+        li.remove(); say('ticked off');
       }catch(e){ li.classList.remove('gone'); tick.checked = false; say('could not tick — ' + e.message, true); }
     };
   });
+
+  // cadence edit toggles and saves
+  $('lists').querySelectorAll('[data-edit]').forEach(b => {
+    b.onclick = () => { const box = b.closest('.body').querySelector('.cadedit'); box.hidden = !box.hidden; };
+  });
+  $('lists').querySelectorAll('.cadedit .save').forEach(b => {
+    const li = b.closest('.task');
+    if (li) b.onclick = () => saveCadence(li.dataset.uid, li);
+  });
+
+  // delete a whole list
+  $('lists').querySelectorAll('.kill').forEach(b => {
+    const sec = b.closest('.lane');
+    b.onclick = async () => {
+      const label = sec.querySelector('h2').childNodes[0].textContent.trim();
+      if (!confirm('Delete the "' + label + '" list and everything in it? This cannot be undone.')) return;
+      try{
+        const r = await fetch('/lists/' + encodeURIComponent(sec.dataset.coll), {method:'DELETE', headers:H});
+        if(!r.ok) throw new Error(r.status);
+        say('deleted'); loadLists('shop');
+      }catch(e){ say('could not delete — ' + e.message, true); }
+    };
+  });
+
+  const nl = $('newlist');
+  if (nl) nl.onsubmit = async ev => {
+    ev.preventDefault();
+    const name = $('newname').value.trim();
+    if (!name) return;
+    try{
+      const r = await fetch('/lists/add', {method:'POST', headers:{...H,'Content-Type':'text/plain'}, body:name});
+      if(!r.ok) throw new Error(r.status);
+      say('list created'); loadLists('shop');
+    }catch(e){ say('could not create — ' + e.message, true); }
+  };
 }
 
 $('addrow').onsubmit = async ev => {

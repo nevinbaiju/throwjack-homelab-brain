@@ -15,6 +15,7 @@ import base64
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -198,6 +199,44 @@ def ensure_collection(collection: str, display_name: str | None = None) -> None:
     code, _, _ = _request("MKCOL", _url(collection), body, {"Content-Type": "application/xml"})
     if code not in (201, 200):
         raise CalDavError(f"could not create collection {collection}: {code}")
+
+
+def list_collections() -> list[dict]:
+    """Every VTODO collection under the principal, with its display name.
+
+    Needed once shopping lists became things you can add and remove: a
+    hardcoded SHOPPING constant cannot describe a list created five minutes
+    ago. The server is the truth.
+    """
+    body = ('<?xml version="1.0"?>'
+            '<propfind xmlns="DAV:" xmlns:C="urn:ietf:params:xml:ns:caldav">'
+            '<prop><displayname/><resourcetype/>'
+            '<C:supported-calendar-component-set/></prop></propfind>').encode()
+    _, _, data = _request("PROPFIND", f"{BASE}/{USER}/", body,
+                          {"Depth": "1", "Content-Type": "application/xml"})
+    text = data.decode("utf-8", errors="replace")
+    out = []
+    for block in re.findall(r"<[^>]*response[^>]*>(.*?)</[^>]*response>", text, re.S):
+        href = re.search(r"<[^>]*href[^>]*>([^<]*)<", block)
+        if not href:
+            continue
+        name = urllib.parse.unquote(href.group(1)).rstrip("/").rsplit("/", 1)[-1]
+        if not name or name == USER:
+            continue
+        # Only VTODO collections; a calendar of events is not a task list.
+        if "VTODO" not in block.upper():
+            continue
+        disp = re.search(r"<[^>]*displayname[^>]*>([^<]*)<", block)
+        out.append({"collection": name,
+                    "label": (disp.group(1).strip() if disp else "") or name})
+    return sorted(out, key=lambda c: c["collection"])
+
+
+def delete_collection(collection: str) -> None:
+    """Remove a whole collection and everything in it. There is no undo."""
+    code, _, _ = _request("DELETE", _url(collection))
+    if code not in (200, 204, 404):
+        raise CalDavError(f"could not delete collection {collection}: {code}")
 
 
 def get_ctag(collection: str) -> str | None:
