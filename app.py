@@ -127,6 +127,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Focus Board Brain", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def no_store(request: Request, call_next):
+    """Never let the browser cache any of this.
+
+    There were no cache headers at all, so the browser was free to apply its
+    own heuristics -- which meant a stale ui.html could keep serving old
+    JavaScript after a rebuild, and a cached /lists.json could hide a list you
+    just created. The page does its own caching in memory, deliberately and
+    visibly; the HTTP layer should not be doing it behind our backs.
+    """
+    response = await call_next(request)
+    response.headers["Cache-Control"] = "no-store, must-revalidate"
+    return response
+
+
 ADMIN_USER = os.environ.get("BRAIN_ADMIN_USER", "")
 ADMIN_HASH = os.environ.get("BRAIN_ADMIN_PASSWORD_HASH", "")
 

@@ -193,10 +193,6 @@ function setMode(next){
   $('lists').classList.toggle('one', next === 'upkeep');
   if (next === 'board'){ loadBoard(); return; }
   if (next === 'upkeep' || next === 'shop'){
-    // Clear first. /lists.json is a round trip to CalDAV, and until it lands
-    // the container still holds the OTHER tab's markup -- which reads as the
-    // wrong page flashing up before the right one.
-    $('lists').innerHTML = '<p class="empty">loading…</p>';
     loadLists(next);
     return;
   }
@@ -227,14 +223,21 @@ function metaLine(t){
 }
 
 async function act(id, verb, li){
-  li.classList.add('gone');                       // optimistic; reverted on failure
+  const lane = li.closest('.lane');
+  const ul = li.parentNode, next = li.nextSibling;
+  li.remove();                                    // optimistic; put back on failure
+  bumpCount(lane, -1);
   try{
     const r = await fetch('/task/' + encodeURIComponent(id) + '/' + verb, {method:'POST', headers:H});
     if(!r.ok) throw new Error(r.status);
+    // The task moved lane, so the cached board is wrong in a way we cannot
+    // patch locally without duplicating the lane rules. Drop it and let the
+    // next visit refetch; the DOM is already correct for right now.
+    CACHE.board = null;
     say(verb === 'done' ? 'done' : verb);
-    loadBoard();
   }catch(e){
-    li.classList.remove('gone');
+    ul.insertBefore(li, next);
+    bumpCount(lane, +1);
     const tick = li.querySelector('.tick');
     if (tick) tick.checked = false;
     say('could not update — ' + e.message, true);
@@ -285,6 +288,8 @@ function wireTick(li, coll){
                             encodeURIComponent(li.dataset.uid) + '/done',
                             {method:'POST', headers:H});
       if(!r.ok) throw new Error(r.status);
+      const shop = shopOf(coll);
+      if (shop) shop.items = shop.items.filter(i => i.uid !== li.dataset.uid);
     }catch(e){
       const ph = ul.querySelector('.empty'); if (ph) ph.remove();
       ul.insertBefore(li, next);
@@ -304,14 +309,33 @@ function itemRow(uid, summary){
   return li;
 }
 
+// Last good payload, kept in memory. A tab switch paints this immediately and
+// then revalidates; without it every switch was a blank 0.6s while CalDAV was
+// asked the same question again. Mutations update it alongside the DOM so the
+// two never disagree, and the revalidation catches anything changed elsewhere.
+const CACHE = {lists:null, board:null};
+
+function shopOf(coll){
+  return (CACHE.lists && CACHE.lists.shopping || []).find(s => s.collection === coll);
+}
+
 async function loadLists(which){
-  let data;
+  if (CACHE.lists) renderLists(which, CACHE.lists);
+  else $('lists').innerHTML = '<p class="empty">loading…</p>';
   try{
     const r = await fetch('/lists.json', {headers:H});
     if(!r.ok) throw new Error(r.status);
-    data = await r.json();
-  }catch(e){ $('lists').innerHTML = '<p class="empty">could not load — ' + esc(e.message) + '</p>'; return; }
+    const data = await r.json();
+    const changed = JSON.stringify(data) !== JSON.stringify(CACHE.lists);
+    CACHE.lists = data;
+    if (changed && (mode === 'upkeep' || mode === 'shop')) renderLists(mode, data);
+  }catch(e){
+    if (!CACHE.lists) $('lists').innerHTML = '<p class="empty">could not load — ' + esc(e.message) + '</p>';
+    else say('could not refresh — ' + e.message, true);
+  }
+}
 
+function renderLists(which, data){
   const out = [];
   if (which === 'upkeep'){
     const items = data.upkeep || [];
@@ -393,6 +417,8 @@ async function loadLists(which){
         const d = await r.json();
         li.dataset.uid = d.uid;                       // only now can it be ticked
         wireTick(li, f.dataset.coll);
+        const shop = shopOf(f.dataset.coll);
+        if (shop) shop.items.push({uid:d.uid, summary:text, description:''});
       }catch(e){
         li.remove();
         bumpCount(lane, -1);
@@ -414,6 +440,8 @@ async function loadLists(which){
       try{
         const r = await fetch('/lists/' + encodeURIComponent(sec.dataset.coll), {method:'DELETE', headers:H});
         if(!r.ok) throw new Error(r.status);
+        if (CACHE.lists) CACHE.lists.shopping =
+          CACHE.lists.shopping.filter(x => x.collection !== sec.dataset.coll);
       }catch(e){
         parent.insertBefore(sec, next);
         say('could not delete — ' + e.message, true);
@@ -426,23 +454,42 @@ async function loadLists(which){
     ev.preventDefault();
     const name = $('newname').value.trim();
     if (!name) return;
+    $('newname').value = '';
     try{
       const r = await fetch('/lists/add', {method:'POST', headers:{...H,'Content-Type':'text/plain'}, body:name});
       if(!r.ok) throw new Error(r.status);
-      say('list created'); loadLists('shop');
-    }catch(e){ say('could not create — ' + e.message, true); }
+      const d = await r.json();
+      // Render from the response. Refetching all eight collections to learn
+      // one name we already have is why a new list took a reload to appear.
+      if (CACHE.lists){
+        if (!shopOf(d.collection))
+          CACHE.lists.shopping.push({collection:d.collection, label:d.label, items:[]});
+        CACHE.lists.shopping.sort((a,b) => a.label.toLowerCase() < b.label.toLowerCase() ? -1 : 1);
+        renderLists('shop', CACHE.lists);
+      }
+      say('list created');
+    }catch(e){ $('newname').value = name; say('could not create — ' + e.message, true); }
   };
 }
 
 
 async function loadBoard(){
-  let data;
+  if (CACHE.board) renderBoard(CACHE.board);
+  else $('board').innerHTML = '<p class="empty">loading…</p>';
   try{
     const r = await fetch('/board.json', {headers:H});
     if(!r.ok) throw new Error(r.status);
-    data = await r.json();
-  }catch(e){ $('board').innerHTML = '<p class="empty">could not load the board — ' + esc(e.message) + '</p>'; return; }
+    const data = await r.json();
+    const changed = JSON.stringify(data) !== JSON.stringify(CACHE.board);
+    CACHE.board = data;
+    if (changed && mode === 'board') renderBoard(data);
+  }catch(e){
+    if (!CACHE.board) $('board').innerHTML = '<p class="empty">could not load the board — ' + esc(e.message) + '</p>';
+    else say('could not refresh — ' + e.message, true);
+  }
+}
 
+function renderBoard(data){
   const out = [];
   for (const lane of data.order){
     const items = data.lanes[lane] || [];
