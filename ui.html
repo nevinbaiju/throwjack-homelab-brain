@@ -262,6 +262,48 @@ async function saveCadence(uid, li){
   }catch(e){ say('could not update — ' + e.message, true); }
 }
 
+// Optimistic list edits. The DOM changes first and the request follows; a
+// failure puts the row back and says so. Waiting on CalDAV before showing the
+// result made every tick feel broken even when it worked.
+function bumpCount(lane, delta){
+  const n = lane && lane.querySelector('h2 .n');
+  if (n) n.textContent = Math.max(0, (parseInt(n.textContent, 10) || 0) + delta);
+}
+
+function wireTick(li, coll){
+  const tick = li.querySelector('.tick');
+  if (!tick) return;
+  tick.onchange = async () => {
+    if (!tick.checked) return;
+    const lane = li.closest('.lane');
+    const ul = li.parentNode, next = li.nextSibling;
+    li.remove();
+    bumpCount(lane, -1);
+    if (!ul.children.length) ul.innerHTML = '<li class="empty">empty</li>';
+    try{
+      const r = await fetch('/list/' + encodeURIComponent(coll) + '/' +
+                            encodeURIComponent(li.dataset.uid) + '/done',
+                            {method:'POST', headers:H});
+      if(!r.ok) throw new Error(r.status);
+    }catch(e){
+      const ph = ul.querySelector('.empty'); if (ph) ph.remove();
+      ul.insertBefore(li, next);
+      tick.checked = false;
+      bumpCount(lane, +1);
+      say('could not tick — ' + e.message, true);
+    }
+  };
+}
+
+function itemRow(uid, summary){
+  const li = document.createElement('li');
+  li.className = 'task';
+  if (uid) li.dataset.uid = uid;
+  li.innerHTML = '<input class="tick" type="checkbox" aria-label="tick off ' + esc(summary) + '">' +
+                 '<div class="body"><div class="t">' + esc(summary) + '</div></div>';
+  return li;
+}
+
 async function loadLists(which){
   let data;
   try{
@@ -316,20 +358,9 @@ async function loadLists(which){
   }
   $('lists').innerHTML = out.join('');
 
-  // tick a grocery item off
-  $('lists').querySelectorAll('.task[data-uid] .tick').forEach(tick => {
-    const li = tick.closest('.task');
-    const coll = li.closest('.lane').dataset.coll;
-    tick.onchange = async () => {
-      if (!tick.checked) return;
-      li.classList.add('gone');
-      try{
-        const r = await fetch('/list/' + encodeURIComponent(coll) + '/' + encodeURIComponent(li.dataset.uid) + '/done',
-                              {method:'POST', headers:H});
-        if(!r.ok) throw new Error(r.status);
-        li.remove(); say('ticked off');
-      }catch(e){ li.classList.remove('gone'); tick.checked = false; say('could not tick — ' + e.message, true); }
-    };
+  $('lists').querySelectorAll('.task[data-uid]').forEach(li => {
+    const lane = li.closest('.lane');
+    if (lane && lane.dataset.coll) wireTick(li, lane.dataset.coll);
   });
 
   // cadence edit toggles and saves
@@ -349,15 +380,26 @@ async function loadLists(which){
       const text = input.value.trim();
       if (!text) return;
       input.value = '';
+      const lane = f.closest('.lane'), ul = lane.querySelector('ul');
+      const ph = ul.querySelector('.empty'); if (ph) ph.remove();
+      const li = itemRow(null, text);
+      ul.appendChild(li);
+      bumpCount(lane, +1);
+      input.focus();                                  // adding one usually means adding two
       try{
         const r = await fetch('/list/' + encodeURIComponent(f.dataset.coll) + '/add',
           {method:'POST', headers:{...H,'Content-Type':'text/plain'}, body:text});
         if(!r.ok) throw new Error(r.status);
-        await loadLists('shop');
-        // Keep the cursor where it was: adding one item usually means adding two.
-        const again = $('lists').querySelector('form.addrow[data-coll="' + f.dataset.coll + '"] input');
-        if (again) again.focus();
-      }catch(e){ input.value = text; say('could not add — ' + e.message, true); }
+        const d = await r.json();
+        li.dataset.uid = d.uid;                       // only now can it be ticked
+        wireTick(li, f.dataset.coll);
+      }catch(e){
+        li.remove();
+        bumpCount(lane, -1);
+        if (!ul.children.length) ul.innerHTML = '<li class="empty">empty</li>';
+        input.value = text;
+        say('could not add — ' + e.message, true);
+      }
     };
   });
 
@@ -367,11 +409,15 @@ async function loadLists(which){
     b.onclick = async () => {
       const label = sec.querySelector('h2').childNodes[0].textContent.trim();
       if (!confirm('Delete the "' + label + '" list and everything in it? This cannot be undone.')) return;
+      const parent = sec.parentNode, next = sec.nextSibling;
+      sec.remove();
       try{
         const r = await fetch('/lists/' + encodeURIComponent(sec.dataset.coll), {method:'DELETE', headers:H});
         if(!r.ok) throw new Error(r.status);
-        say('deleted'); loadLists('shop');
-      }catch(e){ say('could not delete — ' + e.message, true); }
+      }catch(e){
+        parent.insertBefore(sec, next);
+        say('could not delete — ' + e.message, true);
+      }
     };
   });
 

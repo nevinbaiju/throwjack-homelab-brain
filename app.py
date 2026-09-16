@@ -483,6 +483,7 @@ async def lists_json(authorization: str | None = Header(default=None),
     """
     _require_auth(authorization, session)
     import caldav, board as bd
+    from concurrent.futures import ThreadPoolExecutor
 
     def live(coll):
         try:
@@ -493,15 +494,26 @@ async def lists_json(authorization: str | None = Header(default=None),
             print(f"[lists] {coll}: {e}", flush=True)
             return []
 
+    shop_map = _shop_collections()
+    upkeep_coll = bd.LANES["upkeep"][0]
+    colls = [upkeep_coll] + list(shop_map)
+
+    # Read every collection at once. Serially this was 2.1s for eight of them --
+    # each is an independent HTTP round trip to Radicale, and waiting for one
+    # before starting the next is the whole cost. They are pure reads, so there
+    # is nothing to order.
+    with ThreadPoolExecutor(max_workers=min(8, len(colls))) as pool:
+        fetched = dict(zip(colls, pool.map(live, colls)))
+
     cadence = _chore_cadence()
     upkeep_items = []
-    for i in sorted(live(bd.LANES["upkeep"][0]), key=lambda i: i["summary"].lower()):
+    for i in sorted(fetched[upkeep_coll], key=lambda i: i["summary"].lower()):
         i["cadence"] = cadence.get(i["uid"])           # None for ones you added on the phone
         upkeep_items.append(i)
 
     shops = [{"collection": c, "label": label,
-              "items": sorted(live(c), key=lambda i: i["summary"].lower())}
-             for c, label in sorted(_shop_collections().items(), key=lambda kv: kv[1].lower())]
+              "items": sorted(fetched.get(c, []), key=lambda i: i["summary"].lower())}
+             for c, label in sorted(shop_map.items(), key=lambda kv: kv[1].lower())]
     return {"upkeep": upkeep_items, "shopping": shops}
 
 
