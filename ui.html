@@ -68,8 +68,15 @@
   .linkish:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
   #recent li{padding:3px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   /* Board */
-  #board{display:none;flex:1;min-height:0;overflow-y:auto;flex-direction:column;gap:18px}
-  #board.on{display:flex}
+  /* Columns on a wide screen, one stack on a phone. auto-fit + minmax does
+     both without a breakpoint, and the wrapper widens only for these tabs so
+     the composer keeps its comfortable reading measure. */
+  .wrap.wide{max-width:1240px}
+  #board,#lists{display:none;flex:1;min-height:0;overflow-y:auto}
+  #board.on,#lists.on{display:grid;gap:16px;align-items:start;
+    grid-template-columns:repeat(auto-fit,minmax(272px,1fr))}
+  #lists.one{grid-template-columns:minmax(0,560px)}
+  .lane{background:var(--raise);border:1px solid var(--rule);border-radius:11px;padding:12px}
   .lane h2{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.09em;
     text-transform:uppercase;color:var(--ink-3);margin:0 0 8px;display:flex;align-items:baseline;gap:8px}
   .lane h2 .n{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
@@ -94,6 +101,17 @@
   .acts button:hover{color:var(--ink)}
   .acts button:focus-visible{outline:2px solid var(--signal);outline-offset:1px}
   .empty{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);padding:2px 0}
+  #addrow{gap:8px;align-items:center;flex-wrap:wrap}
+  #addrow.on{display:flex}
+  #additem{flex:1;min-width:160px;font-size:15px;padding:9px 11px;background:var(--surface);
+    color:var(--ink);border:1px solid var(--rule);border-radius:7px}
+  #addto{font-family:var(--mono);font-size:12px;padding:9px;background:var(--surface);
+    color:var(--ink);border:1px solid var(--rule);border-radius:7px}
+  #addbtn{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.07em;
+    text-transform:uppercase;padding:9px 16px;border:0;border-radius:7px;cursor:pointer;
+    background:var(--accent);color:var(--accent-ink)}
+  #additem:focus-visible,#addto:focus-visible,#addbtn:focus-visible{
+    outline:2px solid var(--signal);outline-offset:2px}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 
@@ -110,6 +128,8 @@
     <button role="tab" id="m-file" aria-selected="true">File task</button>
     <button role="tab" id="m-plan" aria-selected="false">Plan task</button>
     <button role="tab" id="m-board" aria-selected="false">Board</button>
+    <button role="tab" id="m-upkeep" aria-selected="false">Upkeep</button>
+    <button role="tab" id="m-shop" aria-selected="false">Groceries</button>
   </div>
 
   <div id="slugrow">
@@ -128,6 +148,12 @@
 
   <ul id="recent" aria-label="recent captures"></ul>
   <div id="board" aria-label="board"></div>
+  <div id="lists" aria-label="lists"></div>
+  <form id="addrow" style="display:none">
+    <input id="additem" placeholder="add an item" autocomplete="off">
+    <select id="addto"></select>
+    <button id="addbtn">Add</button>
+  </form>
 </div>
 
 <script>
@@ -139,18 +165,23 @@ let mode = 'file';
 
 $('kbd').textContent = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘↵ to send' : 'Ctrl+↵ to send';
 
+const TABS = {file:'m-file', plan:'m-plan', board:'m-board', upkeep:'m-upkeep', shop:'m-shop'};
+
 function setMode(next){
   mode = next;
-  const board = next === 'board';
-  $('m-file').setAttribute('aria-selected', next === 'file');
-  $('m-plan').setAttribute('aria-selected', next === 'plan');
-  $('m-board').setAttribute('aria-selected', board);
+  const composing = next === 'file' || next === 'plan';
+  for (const [k, id] of Object.entries(TABS)) $(id).setAttribute('aria-selected', k === next);
   $('slugrow').classList.toggle('on', next === 'plan');
-  // The composer and the board share the column; only one is ever present.
-  for (const id of ['text','recent']) $(id).style.display = board ? 'none' : '';
-  document.querySelector('.bar').style.display = board ? 'none' : '';
-  $('board').classList.toggle('on', board);
-  if (board){ loadBoard(); return; }
+  // The composer, the board and the lists share the column; one at a time.
+  for (const id of ['text','recent']) $(id).style.display = composing ? '' : 'none';
+  document.querySelector('.bar').style.display = composing ? '' : 'none';
+  document.querySelector('.wrap').classList.toggle('wide', !composing);
+  $('board').classList.toggle('on', next === 'board');
+  $('lists').classList.toggle('on', next === 'upkeep' || next === 'shop');
+  $('lists').classList.toggle('one', next === 'upkeep');
+  $('addrow').classList.toggle('on', next === 'shop');
+  if (next === 'board'){ loadBoard(); return; }
+  if (next === 'upkeep' || next === 'shop'){ loadLists(next); return; }
   $('text').placeholder = next === 'plan'
     ? 'Everything you know about this project. Messy is fine — it gets broken into ordered steps, and your raw text is kept verbatim.'
     : 'One thing. It lands on disk before anything reads it.';
@@ -159,6 +190,8 @@ function setMode(next){
 $('m-file').onclick = () => setMode('file');
 $('m-plan').onclick = () => setMode('plan');
 $('m-board').onclick = () => setMode('board');
+$('m-upkeep').onclick = () => setMode('upkeep');
+$('m-shop').onclick = () => setMode('shop');
 
 const LANE_LABEL = {in_progress:'In progress', backlog:'Backlog', waiting:'Waiting', done:'Done'};
 
@@ -189,6 +222,79 @@ async function act(id, verb, li){
     say('could not update — ' + e.message, true);
   }
 }
+
+let SHOPS = [];
+
+async function loadLists(which){
+  let data;
+  try{
+    const r = await fetch('/lists.json', {headers:H});
+    if(!r.ok) throw new Error(r.status);
+    data = await r.json();
+  }catch(e){ $('lists').innerHTML = '<p class="empty">could not load — ' + esc(e.message) + '</p>'; return; }
+
+  const out = [];
+  if (which === 'upkeep'){
+    const items = data.upkeep || [];
+    // Read-only on purpose: these carry an RRULE and iOS owns the recurrence.
+    out.push('<section class="lane"><h2>Upkeep<span class="n">' + items.length + '</span></h2><ul>');
+    if (!items.length) out.push('<li class="empty">nothing here</li>');
+    for (const i of items){
+      out.push('<li class="task' + (i.done ? ' done-row' : '') + '">' +
+        '<input class="tick" type="checkbox" disabled ' + (i.done ? 'checked' : '') + ' aria-label="' + esc(i.summary) + '">' +
+        '<div class="body"><div class="t">' + esc(i.summary) + '</div>' +
+        (i.description ? '<div class="meta">' + esc(i.description) + '</div>' : '') +
+        '</div></li>');
+    }
+    out.push('</ul><p class="empty">recurring — tick these in Reminders, iOS owns the schedule</p></section>');
+  } else {
+    SHOPS = (data.shopping || []).map(s => [s.collection, s.label]);
+    $('addto').innerHTML = SHOPS.map(([c,l]) => '<option value="' + esc(c) + '">' + esc(l) + '</option>').join('');
+    for (const shop of data.shopping || []){
+      const open = shop.items.filter(i => !i.done);
+      out.push('<section class="lane" data-coll="' + esc(shop.collection) + '"><h2>' + esc(shop.label) +
+               '<span class="n">' + open.length + '</span></h2><ul>');
+      if (!shop.items.length) out.push('<li class="empty">empty</li>');
+      for (const i of shop.items){
+        out.push('<li class="task' + (i.done ? ' done-row' : '') + '" data-uid="' + esc(i.uid) + '">' +
+          '<input class="tick" type="checkbox" ' + (i.done ? 'checked disabled' : '') +
+            ' aria-label="tick off ' + esc(i.summary) + '">' +
+          '<div class="body"><div class="t">' + esc(i.summary) + '</div></div></li>');
+      }
+      out.push('</ul></section>');
+    }
+  }
+  $('lists').innerHTML = out.join('');
+
+  $('lists').querySelectorAll('.task[data-uid]').forEach(li => {
+    const tick = li.querySelector('.tick');
+    if (!tick || tick.disabled) return;
+    const coll = li.closest('.lane').dataset.coll;
+    tick.onchange = async () => {
+      if (!tick.checked) return;
+      li.classList.add('gone');
+      try{
+        const r = await fetch('/list/' + encodeURIComponent(coll) + '/' + encodeURIComponent(li.dataset.uid) + '/done',
+                              {method:'POST', headers:H});
+        if(!r.ok) throw new Error(r.status);
+        say('ticked off'); loadLists('shop');
+      }catch(e){ li.classList.remove('gone'); tick.checked = false; say('could not tick — ' + e.message, true); }
+    };
+  });
+}
+
+$('addrow').onsubmit = async ev => {
+  ev.preventDefault();
+  const text = $('additem').value.trim();
+  if (!text) return;
+  $('additem').value = '';
+  try{
+    const r = await fetch('/list/' + encodeURIComponent($('addto').value) + '/add',
+      {method:'POST', headers:{...H, 'Content-Type':'text/plain'}, body:text});
+    if(!r.ok) throw new Error(r.status);
+    say('added'); loadLists('shop');
+  }catch(e){ $('additem').value = text; say('could not add — ' + e.message, true); }
+};
 
 async function loadBoard(){
   let data;

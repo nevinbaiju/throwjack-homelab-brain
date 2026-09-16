@@ -441,6 +441,87 @@ async def task_state(task_id: str, verb: str,
         conn.close()
 
 
+def _shop_collections() -> dict[str, str]:
+    import board as bd
+    return {c: label for c, label in bd.SHOPPING}
+
+
+@app.get("/lists.json")
+async def lists_json(authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Upkeep and the shopping lists, read straight from CalDAV.
+
+    Neither lives in SQLite. Upkeep items are VTODOs the brain writes with an
+    RRULE and iOS owns thereafter; the shop-* collections the brain never
+    touches at all -- they are yours, and this only reads them.
+    """
+    _require_auth(authorization, session)
+    import caldav, board as bd
+
+    def read(coll):
+        try:
+            return [{"uid": x["uid"], "summary": x["summary"],
+                     "description": x.get("description") or "",
+                     "done": x["status"] == "COMPLETED", "due": x.get("due")}
+                    for x in caldav.list_todos(coll)]
+        except caldav.CalDavError as e:
+            print(f"[lists] {coll}: {e}", flush=True)
+            return []
+
+    upkeep = sorted(read(bd.LANES["upkeep"][0]), key=lambda i: (i["done"], i["summary"].lower()))
+    shops = []
+    for coll, label in bd.SHOPPING:
+        items = sorted(read(coll), key=lambda i: (i["done"], i["summary"].lower()))
+        shops.append({"collection": coll, "label": label, "items": items})
+    return {"upkeep": upkeep, "shopping": shops}
+
+
+@app.post("/list/{collection}/add")
+async def list_add(collection: str, request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Add one item to a shopping list. Shopping only -- upkeep is generated."""
+    _require_auth(authorization, session)
+    import caldav
+    if collection not in _shop_collections():
+        raise HTTPException(status_code=400, detail="not a shopping list")
+    text, _ = await _extract_text(request)
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty item")
+    uid = f"g_{uuid.uuid4().hex[:12]}"
+    caldav.put_todo(collection, uid, caldav.build_vtodo(uid, text[:255]))
+    return {"ok": True, "uid": uid}
+
+
+@app.post("/list/{collection}/{uid}/done")
+async def list_done(collection: str, uid: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Tick a shopping item off.
+
+    Shopping only. Upkeep items carry an RRULE and iOS owns the recurrence --
+    completing one from here risks closing the series instead of the occurrence,
+    so that tab stays read-only.
+
+    Rewritten from summary + description rather than patched in place, because
+    get_todo returns a parsed dict, not the raw ICS. If-Match means a change
+    made on the phone since we read it wins instead of being clobbered.
+    """
+    _require_auth(authorization, session)
+    import caldav
+    if collection not in _shop_collections():
+        raise HTTPException(status_code=400, detail="not a shopping list")
+    current = [x for x in caldav.list_todos(collection) if x["uid"] == uid]
+    if not current:
+        raise HTTPException(status_code=404, detail="no such item")
+    item = current[0]
+    ics = caldav.build_vtodo(uid, item["summary"],
+                             description=item.get("description") or "", completed=True)
+    caldav.put_todo(collection, uid, ics, etag=item.get("etag"))
+    return {"ok": True, "uid": uid}
+
+
 @app.post("/repush")
 async def repush(check: bool = False, authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
