@@ -103,16 +103,16 @@
   .empty{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);padding:2px 0}
   /* display lives here, not inline: an inline style beats .on and the row
      would never appear no matter what the class said. */
-  #addrow{display:none;gap:8px;align-items:center;flex-wrap:wrap}
-  #addrow.on{display:flex}
-  #additem{flex:1;min-width:160px;font-size:15px;padding:9px 11px;background:var(--surface);
+  /* One add row per list, sitting inside that list's card. A global bar with a
+     store picker made you name the list twice: once by looking at it, once in
+     a dropdown. */
+  .addrow{display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--rule)}
+  .addrow input{flex:1;min-width:0;font-size:14px;padding:7px 9px;background:var(--surface);
     color:var(--ink);border:1px solid var(--rule);border-radius:7px}
-  #addto{font-family:var(--mono);font-size:12px;padding:9px;background:var(--surface);
-    color:var(--ink);border:1px solid var(--rule);border-radius:7px}
-  #addbtn{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.07em;
-    text-transform:uppercase;padding:9px 16px;border:0;border-radius:7px;cursor:pointer;
-    background:var(--accent);color:var(--accent-ink)}
-  #additem:focus-visible,#addto:focus-visible,#addbtn:focus-visible{
+  .addrow input::placeholder{color:var(--ink-3)}
+  .addrow button{flex:none;width:34px;font-size:17px;line-height:1;cursor:pointer;
+    background:var(--accent);color:var(--accent-ink);border:0;border-radius:7px}
+  .addrow input:focus-visible,.addrow button:focus-visible{
     outline:2px solid var(--signal);outline-offset:2px}
   .lane h2 .kill{margin-left:auto;font-family:var(--mono);font-size:11px;padding:2px 7px;
     cursor:pointer;background:transparent;color:var(--ink-3);border:1px solid var(--rule);
@@ -166,11 +166,6 @@
   <ul id="recent" aria-label="recent captures"></ul>
   <div id="board" aria-label="board"></div>
   <div id="lists" aria-label="lists"></div>
-  <form id="addrow">
-    <input id="additem" placeholder="add an item" autocomplete="off">
-    <select id="addto"></select>
-    <button id="addbtn">Add</button>
-  </form>
 </div>
 
 <script>
@@ -196,9 +191,15 @@ function setMode(next){
   $('board').classList.toggle('on', next === 'board');
   $('lists').classList.toggle('on', next === 'upkeep' || next === 'shop');
   $('lists').classList.toggle('one', next === 'upkeep');
-  $('addrow').classList.toggle('on', next === 'shop');
   if (next === 'board'){ loadBoard(); return; }
-  if (next === 'upkeep' || next === 'shop'){ loadLists(next); return; }
+  if (next === 'upkeep' || next === 'shop'){
+    // Clear first. /lists.json is a round trip to CalDAV, and until it lands
+    // the container still holds the OTHER tab's markup -- which reads as the
+    // wrong page flashing up before the right one.
+    $('lists').innerHTML = '<p class="empty">loading…</p>';
+    loadLists(next);
+    return;
+  }
   $('text').placeholder = next === 'plan'
     ? 'Everything you know about this project. Messy is fine — it gets broken into ordered steps, and your raw text is kept verbatim.'
     : 'One thing. It lands on disk before anything reads it.';
@@ -239,8 +240,6 @@ async function act(id, verb, li){
     say('could not update — ' + e.message, true);
   }
 }
-
-let SHOPS = [];
 
 function cadenceText(c){
   if (!c) return 'added on the phone — cadence lives in Reminders';
@@ -294,8 +293,6 @@ async function loadLists(which){
     }
     out.push('</ul><p class="empty">tick these off in Reminders — iOS owns the recurrence</p></section>');
   } else {
-    SHOPS = (data.shopping || []).map(s => [s.collection, s.label]);
-    $('addto').innerHTML = SHOPS.map(([c,l]) => '<option value="' + esc(c) + '">' + esc(l) + '</option>').join('');
     for (const shop of data.shopping || []){
       out.push('<section class="lane" data-coll="' + esc(shop.collection) + '"><h2>' + esc(shop.label) +
                '<span class="n">' + shop.items.length + '</span>' +
@@ -306,7 +303,11 @@ async function loadLists(which){
           '<input class="tick" type="checkbox" aria-label="tick off ' + esc(i.summary) + '">' +
           '<div class="body"><div class="t">' + esc(i.summary) + '</div></div></li>');
       }
-      out.push('</ul></section>');
+      out.push('</ul>' +
+        '<form class="addrow" data-coll="' + esc(shop.collection) + '">' +
+          '<input placeholder="add to ' + esc(shop.label) + '" aria-label="add to ' + esc(shop.label) + '" autocomplete="off">' +
+          '<button type="submit" title="add">+</button>' +
+        '</form></section>');
     }
     out.push('<section class="lane"><h2>New list</h2>' +
              '<form id="newlist"><div class="cadedit">' +
@@ -340,6 +341,26 @@ async function loadLists(which){
     if (li) b.onclick = () => saveCadence(li.dataset.uid, li);
   });
 
+  // add an item, from inside the list it belongs to
+  $('lists').querySelectorAll('form.addrow').forEach(f => {
+    f.onsubmit = async ev => {
+      ev.preventDefault();
+      const input = f.querySelector('input');
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      try{
+        const r = await fetch('/list/' + encodeURIComponent(f.dataset.coll) + '/add',
+          {method:'POST', headers:{...H,'Content-Type':'text/plain'}, body:text});
+        if(!r.ok) throw new Error(r.status);
+        await loadLists('shop');
+        // Keep the cursor where it was: adding one item usually means adding two.
+        const again = $('lists').querySelector('form.addrow[data-coll="' + f.dataset.coll + '"] input');
+        if (again) again.focus();
+      }catch(e){ input.value = text; say('could not add — ' + e.message, true); }
+    };
+  });
+
   // delete a whole list
   $('lists').querySelectorAll('.kill').forEach(b => {
     const sec = b.closest('.lane');
@@ -367,18 +388,6 @@ async function loadLists(which){
   };
 }
 
-$('addrow').onsubmit = async ev => {
-  ev.preventDefault();
-  const text = $('additem').value.trim();
-  if (!text) return;
-  $('additem').value = '';
-  try{
-    const r = await fetch('/list/' + encodeURIComponent($('addto').value) + '/add',
-      {method:'POST', headers:{...H, 'Content-Type':'text/plain'}, body:text});
-    if(!r.ok) throw new Error(r.status);
-    say('added'); loadLists('shop');
-  }catch(e){ $('additem').value = text; say('could not add — ' + e.message, true); }
-};
 
 async function loadBoard(){
   let data;
