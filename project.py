@@ -613,15 +613,18 @@ _DIRECTIVE_LANE = {"done": ("done", "completed"), "doing": ("in_progress", "need
                    "blocked": ("waiting", "needs_action"), "drop": (None, None)}
 
 
-def apply_directive(conn, text: str) -> str | None:
-    """If this capture is a status directive, apply it and return the task id."""
-    m = _DIRECTIVE_RE.search(text or "")
-    if not m:
-        return None
-    verb, task_id = m.group(1).lower(), m.group(2)
+def set_state(conn, task_id: str, verb: str) -> bool:
+    """Apply done/doing/blocked/drop to a task.
+
+    One implementation, shared by capture directives and the web board. A second
+    copy would drift, and the half that drifted would be the one that stops
+    logging or stops updating the card.
+    """
+    if verb not in _DIRECTIVE_LANE:
+        return False
     row = conn.execute("SELECT * FROM tasks WHERE id=? AND archived=0", (task_id,)).fetchone()
     if row is None:
-        return None                      # unknown id: fall through to normal triage
+        return False
 
     lane, status = _DIRECTIVE_LANE[verb]
     ts = store.now_iso()
@@ -643,8 +646,17 @@ def apply_directive(conn, text: str) -> str | None:
         else:
             triage.project_to_board(conn, task_id)
     except caldav.CalDavError as e:
-        print(f"[directive] {task_id}: board update failed: {e}", flush=True)
-    return task_id
+        print(f"[state] {task_id}: board update failed: {e}", flush=True)
+    return True
+
+
+def apply_directive(conn, text: str) -> str | None:
+    """If this capture is a status directive, apply it and return the task id."""
+    m = _DIRECTIVE_RE.search(text or "")
+    if not m:
+        return None
+    verb, task_id = m.group(1).lower(), m.group(2)
+    return task_id if set_state(conn, task_id, verb) else None
 
 
 def ingest_captures(conn, slug: str) -> int:

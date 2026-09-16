@@ -67,6 +67,33 @@
     font-family:var(--mono);font-size:11.5px;color:var(--ink-3);text-decoration:underline}
   .linkish:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
   #recent li{padding:3px 0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  /* Board */
+  #board{display:none;flex:1;min-height:0;overflow-y:auto;flex-direction:column;gap:18px}
+  #board.on{display:flex}
+  .lane h2{font-family:var(--cond);font-weight:700;font-size:12px;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--ink-3);margin:0 0 8px;display:flex;align-items:baseline;gap:8px}
+  .lane h2 .n{font-family:var(--mono);font-size:11px;color:var(--ink-3)}
+  .lane ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+  .task{display:flex;gap:10px;align-items:flex-start;padding:10px 12px;background:var(--surface);
+    border:1px solid var(--rule);border-radius:9px}
+  .task.pin{border-color:var(--signal)}
+  .task.gone{opacity:.35}
+  .tick{appearance:none;flex:none;width:17px;height:17px;margin-top:2px;cursor:pointer;
+    border:1.5px solid var(--ink-3);border-radius:5px;background:transparent}
+  .tick:checked{background:var(--ok);border-color:var(--ok)}
+  .tick:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+  .task .body{min-width:0;flex:1}
+  .task .t{font-size:15px;line-height:1.35;overflow-wrap:anywhere}
+  .task.done-row .t{text-decoration:line-through;color:var(--ink-3)}
+  .meta{font-family:var(--mono);font-size:11px;color:var(--ink-3);margin-top:3px;
+    display:flex;gap:10px;flex-wrap:wrap}
+  .meta .p1{color:var(--signal);font-weight:500}
+  .acts{display:flex;gap:4px;flex:none}
+  .acts button{font-family:var(--mono);font-size:10.5px;padding:3px 7px;cursor:pointer;
+    background:var(--raise);color:var(--ink-2);border:1px solid var(--rule);border-radius:5px}
+  .acts button:hover{color:var(--ink)}
+  .acts button:focus-visible{outline:2px solid var(--signal);outline-offset:1px}
+  .empty{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);padding:2px 0}
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 
@@ -82,6 +109,7 @@
   <div class="modes" role="tablist">
     <button role="tab" id="m-file" aria-selected="true">File task</button>
     <button role="tab" id="m-plan" aria-selected="false">Plan task</button>
+    <button role="tab" id="m-board" aria-selected="false">Board</button>
   </div>
 
   <div id="slugrow">
@@ -99,6 +127,7 @@
   </div>
 
   <ul id="recent" aria-label="recent captures"></ul>
+  <div id="board" aria-label="board"></div>
 </div>
 
 <script>
@@ -112,9 +141,16 @@ $('kbd').textContent = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘↵ to s
 
 function setMode(next){
   mode = next;
+  const board = next === 'board';
   $('m-file').setAttribute('aria-selected', next === 'file');
   $('m-plan').setAttribute('aria-selected', next === 'plan');
+  $('m-board').setAttribute('aria-selected', board);
   $('slugrow').classList.toggle('on', next === 'plan');
+  // The composer and the board share the column; only one is ever present.
+  for (const id of ['text','recent']) $(id).style.display = board ? 'none' : '';
+  document.querySelector('.bar').style.display = board ? 'none' : '';
+  $('board').classList.toggle('on', board);
+  if (board){ loadBoard(); return; }
   $('text').placeholder = next === 'plan'
     ? 'Everything you know about this project. Messy is fine — it gets broken into ordered steps, and your raw text is kept verbatim.'
     : 'One thing. It lands on disk before anything reads it.';
@@ -122,6 +158,80 @@ function setMode(next){
 }
 $('m-file').onclick = () => setMode('file');
 $('m-plan').onclick = () => setMode('plan');
+$('m-board').onclick = () => setMode('board');
+
+const LANE_LABEL = {in_progress:'In progress', backlog:'Backlog', waiting:'Waiting', done:'Done'};
+
+function esc(t){ const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
+
+function metaLine(t){
+  const bits = [];
+  if (t.pinned) bits.push('<span class="p1">P0</span>');
+  else if (t.priority === 1) bits.push('<span class="p1">!!!</span>');
+  if (t.project) bits.push(esc(t.project));
+  if (t.estimate_min) bits.push(esc(t.estimate_min) + 'm');
+  if (t.due) bits.push('due ' + esc(t.due));
+  if (t.why) bits.push(esc(t.why));
+  return bits.join('<span aria-hidden="true">·</span>');
+}
+
+async function act(id, verb, li){
+  li.classList.add('gone');                       // optimistic; reverted on failure
+  try{
+    const r = await fetch('/task/' + encodeURIComponent(id) + '/' + verb, {method:'POST', headers:H});
+    if(!r.ok) throw new Error(r.status);
+    say(verb === 'done' ? 'done' : verb);
+    loadBoard();
+  }catch(e){
+    li.classList.remove('gone');
+    const tick = li.querySelector('.tick');
+    if (tick) tick.checked = false;
+    say('could not update — ' + e.message, true);
+  }
+}
+
+async function loadBoard(){
+  let data;
+  try{
+    const r = await fetch('/board.json', {headers:H});
+    if(!r.ok) throw new Error(r.status);
+    data = await r.json();
+  }catch(e){ $('board').innerHTML = '<p class="empty">could not load the board — ' + esc(e.message) + '</p>'; return; }
+
+  const out = [];
+  for (const lane of data.order){
+    const items = data.lanes[lane] || [];
+    if (!items.length && lane !== 'in_progress') continue;   // in progress is worth showing empty
+    out.push('<section class="lane"><h2>' + esc(LANE_LABEL[lane] || lane) +
+             '<span class="n">' + items.length + '</span></h2><ul>');
+    if (!items.length) out.push('<li class="empty">nothing here</li>');
+    for (const t of items){
+      const isDone = lane === 'done';
+      out.push(
+        '<li class="task' + (t.pinned ? ' pin' : '') + (isDone ? ' done-row' : '') + '" data-id="' + esc(t.id) + '">' +
+          '<input class="tick" type="checkbox" ' + (isDone ? 'checked disabled' : '') +
+            ' aria-label="complete ' + esc(t.title) + '">' +
+          '<div class="body"><div class="t">' + esc(t.title) + '</div>' +
+            '<div class="meta">' + metaLine(t) + '</div></div>' +
+          (isDone ? '' :
+            '<div class="acts">' +
+              (lane === 'in_progress' ? '' : '<button data-verb="doing" title="move to In progress">start</button>') +
+              (lane === 'waiting' ? '' : '<button data-verb="blocked" title="move to Waiting">wait</button>') +
+              '<button data-verb="drop" title="archive">drop</button>' +
+            '</div>') +
+        '</li>');
+    }
+    out.push('</ul></section>');
+  }
+  $('board').innerHTML = out.join('');
+
+  $('board').querySelectorAll('.task').forEach(li => {
+    const id = li.dataset.id;
+    const tick = li.querySelector('.tick');
+    if (tick && !tick.disabled) tick.onchange = () => tick.checked && act(id, 'done', li);
+    li.querySelectorAll('.acts button').forEach(b => { b.onclick = () => act(id, b.dataset.verb, li); });
+  });
+}
 
 function say(msg, bad){
   const s = $('status');

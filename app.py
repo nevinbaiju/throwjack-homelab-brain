@@ -387,6 +387,60 @@ async def project_status(slug: str, authorization: str | None = Header(default=N
         conn.close()
 
 
+@app.get("/board.json")
+async def board_json(authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """The board as structured data, for the web UI.
+
+    /board renders the same thing as plain text for the CLI. This carries the
+    fields CalDAV cannot: score, why, project, seq, consequence. Those are the
+    reason a view here beats any CalDAV client.
+    """
+    _require_auth(authorization, session)
+    import store, board as bd
+    conn = store.connect()
+    try:
+        now = store.now_iso()
+        lanes: dict[str, list] = {}
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE archived=0 AND ("
+            "  status!='completed' OR completed_at >= date('now','-2 days')"
+            ") ORDER BY seq, score DESC").fetchall()
+        for r in rows:
+            pinned = bool(r["pinned_until"]) and str(r["pinned_until"]) > now
+            lanes.setdefault(r["lane"] or "backlog", []).append({
+                "id": r["id"], "title": r["title"], "why": r["why"] or r["note"] or "",
+                "track": r["track"], "project": r["project"], "due": r["due"],
+                "estimate_min": r["estimate_min"], "consequence": r["consequence"],
+                "score": round(r["score"] or 0.0, 1),
+                "priority": bd._priority(r["score"] or 0.0),
+                "pinned": pinned, "status": r["status"],
+            })
+        return {"lanes": lanes,
+                "order": ["in_progress", "backlog", "waiting", "done"]}
+    finally:
+        conn.close()
+
+
+@app.post("/task/{task_id}/{verb}")
+async def task_state(task_id: str, verb: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Move or close one task. Same path a capture directive takes."""
+    _require_auth(authorization, session)
+    import store, project
+    if verb not in ("done", "doing", "blocked", "drop"):
+        raise HTTPException(status_code=400, detail="unknown verb")
+    conn = store.connect()
+    try:
+        if not project.set_state(conn, task_id, verb):
+            raise HTTPException(status_code=404, detail="no such task")
+        conn.commit()
+        return {"ok": True, "id": task_id, "verb": verb}
+    finally:
+        conn.close()
+
+
 @app.post("/repush")
 async def repush(check: bool = False, authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
