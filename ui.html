@@ -101,7 +101,9 @@
   .acts button:hover{color:var(--ink)}
   .acts button:focus-visible{outline:2px solid var(--signal);outline-offset:1px}
   .empty{font-family:var(--mono);font-size:11.5px;color:var(--ink-3);padding:2px 0}
-  #addrow{gap:8px;align-items:center;flex-wrap:wrap}
+  /* display lives here, not inline: an inline style beats .on and the row
+     would never appear no matter what the class said. */
+  #addrow{display:none;gap:8px;align-items:center;flex-wrap:wrap}
   #addrow.on{display:flex}
   #additem{flex:1;min-width:160px;font-size:15px;padding:9px 11px;background:var(--surface);
     color:var(--ink);border:1px solid var(--rule);border-radius:7px}
@@ -164,7 +166,7 @@
   <ul id="recent" aria-label="recent captures"></ul>
   <div id="board" aria-label="board"></div>
   <div id="lists" aria-label="lists"></div>
-  <form id="addrow" style="display:none">
+  <form id="addrow">
     <input id="additem" placeholder="add an item" autocomplete="off">
     <select id="addto"></select>
     <button id="addbtn">Add</button>

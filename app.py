@@ -537,6 +537,52 @@ async def lists_delete(collection: str,
     return {"ok": True, "collection": collection}
 
 
+@app.post("/list/{collection}/add")
+async def list_add(collection: str, request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Add one item to a shopping list. Shopping only -- upkeep is generated."""
+    _require_auth(authorization, session)
+    import caldav
+    if collection not in _shop_collections():
+        raise HTTPException(status_code=400, detail="not a shopping list")
+    text, _ = await _extract_text(request)
+    text = text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="empty item")
+    uid = f"g_{uuid.uuid4().hex[:12]}"
+    caldav.put_todo(collection, uid, caldav.build_vtodo(uid, text[:255]))
+    return {"ok": True, "uid": uid}
+
+
+@app.post("/list/{collection}/{uid}/done")
+async def list_done(collection: str, uid: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Tick a shopping item off.
+
+    Shopping only. Upkeep items carry an RRULE and iOS owns the recurrence --
+    completing one from here risks closing the series instead of the occurrence,
+    so that tab stays read-only.
+
+    Rewritten from summary + description rather than patched in place, because
+    get_todo returns a parsed dict, not the raw ICS. If-Match means a change
+    made on the phone since we read it wins instead of being clobbered.
+    """
+    _require_auth(authorization, session)
+    import caldav
+    if collection not in _shop_collections():
+        raise HTTPException(status_code=400, detail="not a shopping list")
+    current = [x for x in caldav.list_todos(collection) if x["uid"] == uid]
+    if not current:
+        raise HTTPException(status_code=404, detail="no such item")
+    item = current[0]
+    ics = caldav.build_vtodo(uid, item["summary"],
+                             description=item.get("description") or "", completed=True)
+    caldav.put_todo(collection, uid, ics, etag=item.get("etag"))
+    return {"ok": True, "uid": uid}
+
+
 @app.post("/upkeep/{uid}/cadence")
 async def upkeep_cadence(uid: str, request: Request,
         authorization: str | None = Header(default=None),
