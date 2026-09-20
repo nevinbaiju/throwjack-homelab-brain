@@ -936,6 +936,34 @@ async def plan_revise(payload: dict,
         conn.close()
 
 
+@app.post("/plan/update")
+async def plan_update(payload: dict,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Tell the plan what happened. Deltas only -- this never re-plans.
+
+    Separate from /plan/revise on purpose. Revise argues with a draft that has
+    not been committed; update changes a day already in motion. Sharing one
+    endpoint would mean one prompt trying to do both, and the failure mode of
+    that is a finished task quietly reshuffling the afternoon.
+    """
+    _require_auth(authorization, session)
+    import store, plan
+    message = str(payload.get("message", "")).strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    conn = store.connect()
+    try:
+        ctx = plan.update_context(conn, message)
+        jid = plan.create_job(conn, "update",
+                              {"system": plan.UPDATE_SYSTEM, "user": json.dumps(ctx)},
+                              message=message)
+        conn.commit()
+        return {"job": jid}
+    finally:
+        conn.close()
+
+
 @app.get("/plan/job/{job_id}")
 async def plan_job(job_id: str,
         authorization: str | None = Header(default=None),
@@ -1001,11 +1029,19 @@ async def plan_result(job_id: str, payload: dict,
             conn.commit()
             return {"ok": True, "state": "failed"}
         raw = str(payload.get("raw", ""))
-        proposal, rejected = plan.validate(conn, raw)
+        # An update is validated against a different, wider op set and is not
+        # allowed to emit a day. Dispatching here keeps that decision next to
+        # the database rather than in the host worker.
+        if row["kind"] == "update":
+            proposal, rejected = plan.validate_update(conn, raw)
+        else:
+            proposal, rejected = plan.validate(conn, raw)
         plan.finish_job(conn, job_id, raw, proposal, rejected)
         conn.commit()
         return {"ok": True, "state": "done",
-                "today": len(proposal["today"]), "rejected": len(rejected)}
+                "today": len(proposal.get("today", [])),
+                "mutations": len(proposal.get("mutations", [])),
+                "rejected": len(rejected)}
     finally:
         conn.close()
 
@@ -1028,16 +1064,24 @@ async def plan_apply(payload: dict, background: BackgroundTasks,
         if row["applied_at"]:
             raise HTTPException(status_code=409, detail="already applied")
         proposal = json.loads(row["proposal"])
-        # The phone may send back a subset: items you unticked are simply not
-        # in the list. Honour that -- you are the authority on your own day.
         keep = payload.get("accept")
-        if isinstance(keep, list):
-            keep = set(keep)
-            proposal["today"] = [i for i in proposal["today"] if i["task_id"] in keep]
-        drop = payload.get("skip_mutations")
-        if drop:
-            proposal["mutations"] = []
-        result = plan.apply(conn, proposal)
+        if row["kind"] == "update":
+            # For an update, `accept` is the indices of the changes you kept.
+            # Unticking one drops just that change; the rest still apply.
+            if isinstance(keep, list):
+                idx = {int(i) for i in keep if str(i).lstrip("-").isdigit()}
+                proposal["mutations"] = [m for n, m in enumerate(proposal["mutations"])
+                                         if n in idx]
+            result = plan.apply_update(conn, proposal)
+        else:
+            # For a draft, `accept` is the task ids you left ticked. You are
+            # the authority on your own day.
+            if isinstance(keep, list):
+                kept = set(keep)
+                proposal["today"] = [i for i in proposal["today"] if i["task_id"] in kept]
+            if payload.get("skip_mutations"):
+                proposal["mutations"] = []
+            result = plan.apply(conn, proposal)
         conn.execute("UPDATE plan_jobs SET applied_at=?, updated_at=? WHERE id=?",
                      (store.now_iso(), store.now_iso(), job_id))
         conn.commit()

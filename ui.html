@@ -630,14 +630,26 @@ async function renderToday(){
     const r = await fetch('/board.json', {headers:H});
     if (r.ok){ const d = await r.json(); cur = (d.lanes && d.lanes.today) || []; }
   } catch (e) { /* offline: the button still works */ }
-  todayShell(
-    (cur.length
-      ? '<h2>Today</h2>' + cur.map(t =>
-          '<div class="pick"><div><div class="t">' + esc(t.title) + '</div></div></div>').join('')
-      : '<p class="empty">Nothing picked for today yet.</p>') +
-    '<div class="row"><button id="mkplan">' +
-      (cur.length ? 'Re-plan my day' : 'Plan my day') + '</button></div>');
+  if (!cur.length){
+    todayShell('<p class="empty">Nothing picked for today yet.</p>' +
+      '<div class="row"><button id="mkplan">Plan my day</button></div>');
+    $('mkplan').onclick = startDraft;
+    return;
+  }
+  // The day is fixed. From here you do not re-plan, you report what happened
+  // and only that changes.
+  todayShell('<h2>Today</h2>' +
+    cur.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
+      (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
+      '</div></div>').join('') +
+    '<textarea id="say" placeholder="what happened? — finished the NDA, radiator is blocked till Tuesday, boiler guy coming at 3"></textarea>' +
+    '<div class="row"><button id="upd">Update</button>' +
+    '<button id="mkplan" class="linkish">Re-plan the whole day</button></div>');
+  $('upd').onclick = sendUpdate;
   $('mkplan').onclick = startDraft;
+  $('say').addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') sendUpdate();
+  });
 }
 
 async function startDraft(){
@@ -646,13 +658,13 @@ async function startDraft(){
     const r = await fetch('/plan/draft', {method:'POST', headers:H});
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
-    waitFor(d.job);
+    waitFor(d.job, j => { JOB = j; renderDraft(); });
   } catch (e) {
     todayShell('<p class="empty">could not start — ' + esc(e.message) + '</p>');
   }
 }
 
-function waitFor(jobId){
+function waitFor(jobId, onDone){
   clearInterval(POLL);
   const t0 = Date.now();
   POLL = setInterval(async () => {
@@ -662,7 +674,7 @@ function waitFor(jobId){
       if (!r.ok) throw new Error(await r.text());
       const j = await r.json();
       if (j.state === 'done'){
-        clearInterval(POLL); JOB = j; renderDraft(); return;
+        clearInterval(POLL); onDone(j); return;
       }
       if (j.state === 'failed'){
         clearInterval(POLL);
@@ -740,7 +752,7 @@ async function sendRevision(){
       body: JSON.stringify({parent: JOB.id, message: msg})});
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
-    waitFor(d.job);
+    waitFor(d.job, j => { JOB = j; renderDraft(); });
   } catch (e) {
     todayShell('<p class="empty">could not send — ' + esc(e.message) + '</p>');
   }
@@ -762,6 +774,75 @@ async function applyDraft(skipMutations){
   } catch (e) {
     todayShell('<p class="empty">could not apply — ' + esc(e.message) + '</p>');
   }
+}
+
+async function sendUpdate(){
+  const msg = ($('say').value || '').trim();
+  if (!msg) { $('say').focus(); return; }
+  todayShell('<p class="spin">Working out what changed…</p>');
+  try {
+    const r = await fetch('/plan/update', {method:'POST',
+      headers:Object.assign({'Content-Type':'application/json'}, H),
+      body: JSON.stringify({message: msg})});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    waitFor(d.job, j => { JOB = j; renderUpdate(); });
+  } catch (e) {
+    todayShell('<p class="empty">could not send — ' + esc(e.message) + '</p>');
+  }
+}
+
+function updLine(m){
+  if (m.op === 'complete')    return '✓ done — ' + esc(m.title || m.task_id);
+  if (m.op === 'from_today')  return '→ off today — ' + esc(m.title || m.task_id);
+  if (m.op === 'to_today')    return '★ onto today — ' + esc(m.title || m.task_id);
+  if (m.op === 'add')         return '＋ new in ' + esc(m.lane) + ' — ' + esc(m.title);
+  if (m.op === 'set_blocked') return '⛔ blocked on ' + esc(m.blocked_on) + ' — ' + esc(m.title || m.task_id);
+  if (m.op === 'clear_blocked') return '✓ unblocked — ' + esc(m.title || m.task_id);
+  if (m.op === 'retitle')     return '↻ “' + esc(m.was || '') + '” → “' + esc(m.title) + '”';
+  if (m.op === 'set_lane')    return '→ ' + esc(m.lane) + ' — ' + esc(m.title || m.task_id);
+  if (m.op === 'note_append') return '＋ note — ' + esc(m.text);
+  return esc(m.op);
+}
+
+function renderUpdate(){
+  const p = JOB.proposal || {mutations:[], notes:''};
+  if (!p.mutations.length){
+    todayShell('<p class="empty">Nothing to change.' +
+      (p.notes ? ' ' + esc(p.notes) : '') + '</p>' +
+      ((JOB.rejected||[]).length ? '<div class="warn">' + esc(JOB.rejected.join('; ')) + '</div>' : '') +
+      '<div class="row"><button id="back">Back</button></div>');
+    $('back').onclick = () => { JOB = null; renderToday(); };
+    return;
+  }
+  // Each change is individually tickable: one wrong reading of your message
+  // should not cost you the other five.
+  let out = '<h2>About to change</h2>';
+  p.mutations.forEach((m, i) => {
+    out += '<label class="pick"><input type="checkbox" checked value="' + i + '">' +
+           '<div><div class="t">' + updLine(m) + '</div></div></label>';
+  });
+  if (p.notes) out += '<div class="notpicked">' + esc(p.notes) + '</div>';
+  if ((JOB.rejected || []).length)
+    out += '<div class="warn">' + esc(JOB.rejected.join('; ')) + '</div>';
+  out += '<div class="row"><button id="doupd">Apply</button>' +
+         '<button id="cancel" class="linkish">Discard</button></div>';
+  todayShell(out);
+  $('cancel').onclick = () => { JOB = null; renderToday(); };
+  $('doupd').onclick = async () => {
+    const accept = Array.from(document.querySelectorAll('#today input[type=checkbox]'))
+                        .filter(c => c.checked).map(c => Number(c.value));
+    todayShell('<p class="spin">Applying…</p>');
+    try {
+      const r = await fetch('/plan/apply', {method:'POST',
+        headers:Object.assign({'Content-Type':'application/json'}, H),
+        body: JSON.stringify({job: JOB.id, accept: accept})});
+      if (!r.ok) throw new Error(await r.text());
+      JOB = null; CACHE.board = null; renderToday();
+    } catch (e) {
+      todayShell('<p class="empty">could not apply — ' + esc(e.message) + '</p>');
+    }
+  };
 }
 
 </script>

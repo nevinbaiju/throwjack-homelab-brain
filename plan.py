@@ -34,7 +34,15 @@ def _is_chore(row) -> bool:
     return str(row["id"]).startswith("u_") or row["track"] == "upkeep"
 
 
+# Ops a DRAFT may propose. A draft is choosing the day; it has no business
+# completing things or inventing tasks.
 OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append"}
+
+# Ops an UPDATE may additionally propose. Mid-day reality is different: things
+# get finished, things appear, things fall off. "add" is here because "the
+# boiler guy is coming at 3" is a real thing that happened to your day and
+# making you go and file it separately is how a plan stops matching the day.
+UPDATE_OPS = OPS | {"complete", "to_today", "from_today", "add"}
 
 
 def build_context(conn, *, journal: str = "") -> dict:
@@ -151,44 +159,16 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
         rejected.append(f"proposed {len(today)} items; capped at {TODAY_CAP}")
         today = today[:TODAY_CAP]
 
+    # Same validator as the update path -- see _resolve(). OPS (not
+    # UPDATE_OPS) is what limits a draft to choosing the day rather than
+    # completing or inventing tasks.
     muts: list[dict] = []
-    for m_ in (data.get("mutations") or [])[:20]:
-        if not isinstance(m_, dict):
-            rejected.append("mutation was not an object"); continue
-        op = str(m_.get("op", ""))
-        tid = str(m_.get("task_id", ""))
-        row = rows.get(tid)
-        if op not in OPS:
-            rejected.append(f"unknown op {op!r}"); continue
-        if row is None:
-            rejected.append(f"mutation on unknown task {tid!r}"); continue
-        if _is_chore(row):
-            rejected.append(f"refused mutation on chore {tid}"); continue
-        if op == "set_lane":
-            lane = str(m_.get("lane", ""))
-            # today is reached by being in "today", never by a lane mutation --
-            # otherwise the model can bypass the cap.
-            if lane not in ("backlog", "in_progress"):
-                rejected.append(f"refused set_lane to {lane!r}"); continue
-            muts.append({"op": op, "task_id": tid, "lane": lane})
-        elif op == "set_blocked":
-            who = str(m_.get("blocked_on", "")).strip()[:120]
-            if not who:
-                rejected.append(f"set_blocked on {tid} with no blocked_on"); continue
-            muts.append({"op": op, "task_id": tid, "blocked_on": who})
-        elif op == "clear_blocked":
-            muts.append({"op": op, "task_id": tid})
-        elif op == "retitle":
-            title = str(m_.get("title", "")).strip()[:200]
-            if not title:
-                rejected.append(f"retitle on {tid} with empty title"); continue
-            muts.append({"op": op, "task_id": tid, "title": title,
-                         "was": row["title"]})
-        elif op == "note_append":
-            txt = str(m_.get("text", "")).strip()[:500]
-            if not txt:
-                rejected.append(f"note_append on {tid} with no text"); continue
-            muts.append({"op": op, "task_id": tid, "text": txt})
+    for raw_m in (data.get("mutations") or [])[:20]:
+        clean, why = _resolve(conn, rows, raw_m, OPS)
+        if clean is None:
+            rejected.append(why or "rejected")
+        else:
+            muts.append(clean)
 
     return ({"today": today, "mutations": muts,
              "notes": str(data.get("notes", ""))[:400]}, rejected)
@@ -330,3 +310,223 @@ This is a REVISION. "previous_proposal" is what you last suggested and
 if they say something is blocked, wrong, bigger than you thought, or simply
 not today, that is a fact, not an opinion to weigh. Re-emit the COMPLETE
 proposal, not a diff -- keep the parts they did not object to."""
+
+
+# ------------------------------------------------------- mid-day updates ---
+# Once a plan is fixed, you do not want to re-plan the day because one thing
+# finished. You want to say what happened and have only that change. This is
+# a separate call with a separate prompt and a separate op set: the update
+# path can complete and create, and it never re-emits the day's list, so
+# there is no way for "the NDA is done" to quietly reshuffle everything else.
+
+UPDATE_SYSTEM = """You are UPDATING a plan that is already fixed for today.
+You are not re-planning. The person is telling you what happened.
+
+Reply with ONLY a JSON object, no prose, no code fence:
+
+{"mutations":[
+   {"op":"complete","task_id":"<id>"},
+   {"op":"from_today","task_id":"<id>"},
+   {"op":"to_today","task_id":"<id>"},
+   {"op":"set_blocked","task_id":"<id>","blocked_on":"<who or what>"},
+   {"op":"clear_blocked","task_id":"<id>"},
+   {"op":"retitle","task_id":"<id>","title":"<new title>"},
+   {"op":"note_append","task_id":"<id>","text":"<one line>"},
+   {"op":"add","title":"<new task>","lane":"today|backlog","note":"<optional>"}],
+ "notes":"<max 40 words: what you changed>"}
+
+Rules:
+- Change ONLY what their message implies. Anything they did not mention stays
+  exactly as it is. Do not tidy, do not re-prioritise, do not re-order.
+- One message often contains several changes. Emit one mutation per change;
+  there is no limit and no need to pick the most important one.
+- "finished / done / sorted that" -> complete.
+- "not happening today / pushing that" -> from_today.
+- "need to do X today too" -> to_today if X already exists, otherwise add
+  with lane "today".
+- "waiting on someone / can't until X" -> set_blocked, and from_today as well
+  if it cannot happen today at all.
+- Something that is new and NOT for today -> add with lane "backlog".
+- Never invent a task_id. Use only ids present in the context. For genuinely
+  new things use "add", which needs no id.
+- If their message implies no change to the board, return an empty mutations
+  list and say why in notes."""
+
+
+def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
+    """One mutation -> (clean mutation, rejection reason). Shared by both
+    paths, because two copies of this would drift and the drifted one would
+    be the half that stopped refusing things."""
+    if not isinstance(m, dict):
+        return None, "mutation was not an object"
+    op = str(m.get("op", ""))
+    if op not in allowed:
+        return None, f"unknown or disallowed op {op!r}"
+
+    if op == "add":
+        title = str(m.get("title", "")).strip()[:200]
+        if not title:
+            return None, "add with no title"
+        lane = str(m.get("lane", "backlog"))
+        if lane not in ("today", "backlog", "in_progress"):
+            lane = "backlog"
+        return {"op": "add", "title": title, "lane": lane,
+                "note": str(m.get("note", ""))[:500]}, None
+
+    tid = str(m.get("task_id", ""))
+    row = rows.get(tid)
+    if row is None:
+        return None, f"mutation on unknown task {tid!r}"
+    if _is_chore(row):
+        return None, f"refused mutation on chore {tid}"
+
+    if op == "set_lane":
+        lane = str(m.get("lane", ""))
+        if lane not in ("backlog", "in_progress"):
+            return None, f"refused set_lane to {lane!r}"
+        return {"op": op, "task_id": tid, "lane": lane}, None
+    if op == "set_blocked":
+        who = str(m.get("blocked_on", "")).strip()[:120]
+        if not who:
+            return None, f"set_blocked on {tid} with no blocked_on"
+        return {"op": op, "task_id": tid, "blocked_on": who}, None
+    if op == "retitle":
+        title = str(m.get("title", "")).strip()[:200]
+        if not title:
+            return None, f"retitle on {tid} with empty title"
+        return {"op": op, "task_id": tid, "title": title, "was": row["title"]}, None
+    if op == "note_append":
+        txt = str(m.get("text", "")).strip()[:500]
+        if not txt:
+            return None, f"note_append on {tid} with no text"
+        return {"op": op, "task_id": tid, "text": txt}, None
+    if op in ("clear_blocked", "complete", "to_today", "from_today"):
+        return {"op": op, "task_id": tid, "title": row["title"]}, None
+    return None, f"unhandled op {op!r}"
+
+
+def validate_update(conn, raw: str) -> tuple[dict, list[str]]:
+    """Update output -> (proposal, rejections). Mutations only, never a day."""
+    rejected: list[str] = []
+    text = raw.strip()
+    m = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.S)
+    if m:
+        text = m.group(1).strip()
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return {"mutations": [], "notes": ""}, ["response was not JSON"]
+    if not isinstance(data, dict):
+        return {"mutations": [], "notes": ""}, ["response was not an object"]
+
+    # An update that re-emits the day is the exact failure this path exists to
+    # prevent. Drop it loudly rather than silently ignoring it.
+    if data.get("today"):
+        rejected.append("ignored a 'today' list: an update may not re-plan the day")
+
+    rows = {r["id"]: r for r in store.active_tasks(conn)}
+    muts: list[dict] = []
+    for raw_m in (data.get("mutations") or [])[:40]:
+        clean, why = _resolve(conn, rows, raw_m, UPDATE_OPS)
+        if clean is None:
+            rejected.append(why or "rejected")
+        else:
+            muts.append(clean)
+
+    # The cap is advisory here, not enforced. Mid-day, "the boiler guy is
+    # coming at 3" is not negotiable just because the list was already full --
+    # but you should be told the day is now overcommitted.
+    adds = sum(1 for m_ in muts if m_["op"] == "to_today"
+               or (m_["op"] == "add" and m_["lane"] == "today"))
+    removes = sum(1 for m_ in muts if m_["op"] in ("from_today", "complete"))
+    if adds:
+        current = len([r for r in store.active_tasks(conn, "today")])
+        after = current + adds - removes
+        if after > TODAY_CAP:
+            rejected.append(f"today would hold {after} items, over the cap of {TODAY_CAP}")
+
+    return {"mutations": muts, "notes": str(data.get("notes", ""))[:400]}, rejected
+
+
+def apply_update(conn, proposal: dict) -> dict:
+    """Execute a validated update. Returns what actually happened, per op,
+    so the phone can show it rather than claiming success generically."""
+    import project
+
+    now = store.now_iso()
+    done: list[str] = []
+
+    for m in proposal.get("mutations", []):
+        op = m["op"]
+        tid = m.get("task_id")
+
+        if op == "add":
+            lane = m["lane"]
+            # Straight into the lane asked for. Capture would normally triage
+            # this, but the whole point is that you already told us what it is
+            # and when it matters; sending it round the loop would put it in
+            # the inbox to be classified by a model that knows less than you.
+            new_id = store.create_task(
+                conn, title=m["title"], note=m["note"], track="focus",
+                lane=lane)
+            if lane == "today":
+                conn.execute("UPDATE tasks SET prev_lane='backlog' WHERE id=?", (new_id,))
+            done.append(f"added “{m['title']}” to {lane}")
+
+        elif op == "complete":
+            # Reuse the one implementation. A second copy here would be the
+            # one that stops logging or stops updating the card.
+            if project.set_state(conn, tid, "done"):
+                done.append(f"completed “{m.get('title', tid)}”")
+
+        elif op == "to_today":
+            row = conn.execute("SELECT lane FROM tasks WHERE id=?", (tid,)).fetchone()
+            if row and row["lane"] != "today":
+                conn.execute(
+                    "UPDATE tasks SET lane='today', prev_lane=?, updated_at=?, touched_at=?"
+                    " WHERE id=?", (row["lane"], now, now, tid))
+                done.append(f"pulled “{m.get('title', tid)}” into today")
+
+        elif op == "from_today":
+            row = conn.execute("SELECT lane, prev_lane FROM tasks WHERE id=?", (tid,)).fetchone()
+            if row and row["lane"] == "today":
+                conn.execute(
+                    "UPDATE tasks SET lane=?, prev_lane=NULL, updated_at=?, touched_at=?"
+                    " WHERE id=?", (row["prev_lane"] or "backlog", now, now, tid))
+                done.append(f"pushed “{m.get('title', tid)}” off today")
+
+        elif op == "set_lane":
+            conn.execute(
+                "UPDATE tasks SET lane=?, updated_at=?, touched_at=? WHERE id=? AND lane!='today'",
+                (m["lane"], now, now, tid))
+            done.append(f"moved “{m.get('title', tid)}” to {m['lane']}")
+        elif op == "set_blocked":
+            conn.execute("UPDATE tasks SET blocked_on=?, updated_at=? WHERE id=?",
+                         (m["blocked_on"], now, tid))
+            done.append(f"blocked on {m['blocked_on']}")
+        elif op == "clear_blocked":
+            conn.execute("UPDATE tasks SET blocked_on=NULL, updated_at=? WHERE id=?", (now, tid))
+            done.append("unblocked")
+        elif op == "retitle":
+            conn.execute("UPDATE tasks SET title=?, updated_at=? WHERE id=?",
+                         (m["title"], now, tid))
+            done.append(f"retitled to “{m['title']}”")
+        elif op == "note_append":
+            conn.execute(
+                "UPDATE tasks SET note = CASE WHEN note='' THEN ? ELSE note || char(10) || ? END,"
+                " updated_at=? WHERE id=?", (m["text"], m["text"], now, tid))
+            done.append("added a note")
+
+    return {"applied": len(done), "changes": done}
+
+
+def update_context(conn, message: str) -> dict:
+    """What an update gets to see: today in full, the rest in brief.
+
+    The other lanes are included because "I should do the passport thing
+    instead" refers to something that is not on today's list, and an update
+    that cannot find it would have to invent a duplicate.
+    """
+    ctx = build_context(conn)
+    ctx["user_says"] = message[:2000]
+    return ctx
