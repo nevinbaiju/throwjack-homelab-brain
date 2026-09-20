@@ -342,6 +342,11 @@ def write_context(conn, slug: str) -> Path:
 
     questions = json.loads(proj["questions"]) if proj else []
     done = [r for r in rows if r["status"] == "completed"]
+    # Today is its own bucket. Without it a task picked for today matches
+    # neither in_progress nor backlog and silently disappears from STATE.md --
+    # so a coding agent reading this folder would re-plan work already chosen
+    # for the day.
+    today = [r for r in rows if r["lane"] == "today" and r["status"] != "completed"]
     doing = [r for r in rows if r["lane"] == "in_progress" and r["status"] != "completed"]
     todo = [r for r in rows if r["lane"] == "backlog" and r["status"] != "completed"]
 
@@ -352,7 +357,8 @@ def write_context(conn, slug: str) -> Path:
     if proj and proj["deadline"]:
         lines += [f"**Deadline:** {proj['deadline']}", ""]
     lines += [f"**Progress:** {len(done)} done / {len(rows)} total", ""]
-    for label, group in (("In progress", doing), ("Next up", todo), ("Done", done)):
+    for label, group in (("Today", today), ("In progress", doing),
+                         ("Next up", todo), ("Done", done)):
         if not group:
             continue
         lines.append(f"## {label}")

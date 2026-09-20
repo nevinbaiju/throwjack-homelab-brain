@@ -170,9 +170,15 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
                       # recurrence and completion, so apply() must not move it
                       # out of the Upkeep list -- it just appears on the day.
                       "is_chore": _is_chore(row)})
-    if len(today) > TODAY_CAP:
-        rejected.append(f"proposed {len(today)} items; capped at {TODAY_CAP}")
-        today = today[:TODAY_CAP]
+    # Advisory, never truncating. Silently dropping the sixth thing you said
+    # you were doing today is worse than an overfull list: you would not know
+    # it had gone. The cap is guidance to the model in the prompt and a
+    # warning to you here.
+    n_today = len(today) + sum(1 for m_ in (data.get("mutations") or [])
+                               if isinstance(m_, dict) and m_.get("op") == "add"
+                               and m_.get("lane") == "today")
+    if n_today > TODAY_CAP:
+        rejected.append(f"today holds {n_today} items, over the cap of {TODAY_CAP}")
 
     # Same validator as the update path -- see _resolve(). OPS (not
     # UPDATE_OPS) is what limits a draft to choosing the day rather than
@@ -189,6 +195,44 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
              "notes": str(data.get("notes", ""))[:400]}, rejected)
 
 
+
+def _sync_projects(conn, slugs: set[str], events: list[tuple[str, str]]) -> list[str]:
+    """Write what happened back into each affected project's folder.
+
+    A task is not only a card on a board; if it belongs to a project it is
+    also a line in contexts/<slug>/STATE.md and tasks.json, which is what a
+    coding agent reads when it picks the project up cold. Changing the lane
+    or the title here without refreshing that folder leaves the agent working
+    from a stale plan -- re-planning work already chosen for today, or
+    chasing a task you renamed.
+
+    Best-effort, exactly like project.log_event: a context write that fails
+    must never lose you the plan you just accepted.
+    """
+    import project
+
+    # write_context FIRST: it creates contexts/<slug>/ if this is the project's
+    # first write, and log_event silently returns when that folder is missing.
+    # Logging first meant the very first event for a project was dropped.
+    written = []
+    for slug in sorted(slugs):
+        try:
+            project.write_context(conn, slug)
+            written.append(slug)
+        except Exception as e:                               # noqa: BLE001
+            print(f"[plan] write_context({slug}) failed: {e}", flush=True)
+    for slug, line in events:
+        try:
+            project.log_event(slug, line)
+        except Exception:                                    # noqa: BLE001
+            pass
+    return written
+
+
+def _project_of(conn, task_id: str) -> str | None:
+    row = conn.execute("SELECT project FROM tasks WHERE id=?", (task_id,)).fetchone()
+    return row["project"] if row and row["project"] else None
+
 def apply(conn, proposal: dict) -> dict:
     """Execute a validated proposal. Only ever called on validate()'s output.
 
@@ -201,6 +245,10 @@ def apply(conn, proposal: dict) -> dict:
     picked = {i["task_id"] for i in proposal.get("today", [])
               if not i.get("is_chore")}
     moved_in = moved_out = 0
+    # A lane move changes which bucket the task occupies in its project's
+    # STATE.md, so selection alone is enough to make that folder stale.
+    slugs: set[str] = set()
+    events: list[tuple[str, str]] = []
 
     for row in store.active_tasks(conn, "today"):
         if row["id"] in picked:
@@ -210,15 +258,21 @@ def apply(conn, proposal: dict) -> dict:
             "UPDATE tasks SET lane=?, prev_lane=NULL, updated_at=?, touched_at=? WHERE id=?",
             (back, now, now, row["id"]))
         moved_out += 1
+        if row["project"]:
+            slugs.add(row["project"])
+            events.append((row["project"], f"**off today** `{row['id']}` — {row['title']}"))
 
     for tid in picked:
-        row = conn.execute("SELECT lane FROM tasks WHERE id=?", (tid,)).fetchone()
+        row = conn.execute("SELECT lane, title, project FROM tasks WHERE id=?", (tid,)).fetchone()
         if row is None or row["lane"] == "today":
             continue
         conn.execute(
             "UPDATE tasks SET lane='today', prev_lane=?, updated_at=?, touched_at=? WHERE id=?",
             (row["lane"], now, now, tid))
         moved_in += 1
+        if row["project"]:
+            slugs.add(row["project"])
+            events.append((row["project"], f"**today** `{tid}` — {row['title']}"))
 
     applied = 0
     for m_ in proposal.get("mutations", []):
@@ -252,9 +306,15 @@ def apply(conn, proposal: dict) -> dict:
                 " updated_at=? WHERE id=?",
                 (m_["text"], m_["text"], now, tid))
         applied += 1
+        if op != "add":
+            slug = _project_of(conn, tid)
+            if slug:
+                slugs.add(slug)
+                events.append((slug, f"**{op}** `{tid}`"))
 
+    synced = _sync_projects(conn, slugs, events)
     return {"today": len(picked), "moved_in": moved_in,
-            "moved_out": moved_out, "mutations": applied}
+            "moved_out": moved_out, "mutations": applied, "projects": synced}
 
 
 # --------------------------------------------------------------- job queue ---
@@ -481,10 +541,17 @@ def apply_update(conn, proposal: dict) -> dict:
 
     now = store.now_iso()
     done: list[str] = []
+    slugs: set[str] = set()
+    events: list[tuple[str, str]] = []
 
     for m in proposal.get("mutations", []):
         op = m["op"]
         tid = m.get("task_id")
+        if tid:
+            slug = _project_of(conn, tid)
+            if slug:
+                slugs.add(slug)
+                events.append((slug, f"**{op}** `{tid}` — {m.get('title', '')}"))
 
         if op == "add":
             lane = m["lane"]
@@ -543,7 +610,10 @@ def apply_update(conn, proposal: dict) -> dict:
                 " updated_at=? WHERE id=?", (m["text"], m["text"], now, tid))
             done.append("added a note")
 
-    return {"applied": len(done), "changes": done}
+    # set_state already logs and refreshes for a completion, but every other
+    # op here writes raw SQL, so the folder still has to be rebuilt.
+    synced = _sync_projects(conn, slugs, events)
+    return {"applied": len(done), "changes": done, "projects": synced}
 
 
 def update_context(conn, message: str) -> dict:
