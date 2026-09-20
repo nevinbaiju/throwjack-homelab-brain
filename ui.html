@@ -230,7 +230,7 @@ for (const [name, id] of Object.entries(TABS)){
   else console.warn('tab button missing:', id);
 }
 
-const LANE_LABEL = {in_progress:'In progress', backlog:'Backlog', waiting:'Waiting', done:'Done'};
+const LANE_LABEL = {today:'Today', in_progress:'In progress', backlog:'Backlog', waiting:'Waiting', done:'Done'};
 
 function esc(t){ const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
 
@@ -627,39 +627,68 @@ let POLL = null;
 function todayShell(inner){ $('today').innerHTML = inner; }
 
 async function renderToday(){
-  if (JOB && JOB.proposal){ renderDraft(); return; }
-  // No draft in play: show what today already is, and the button.
-  let cur = [];
+  if (JOB && JOB.proposal){ (JOB.kind === 'update' ? renderUpdate : renderDraft)(); return; }
+  let lanes = {};
   try {
     const r = await fetch('/board.json', {headers:H});
-    if (r.ok){ const d = await r.json(); cur = (d.lanes && d.lanes.today) || []; }
-  } catch (e) { /* offline: the button still works */ }
-  if (!cur.length){
-    todayShell('<p class="empty">Nothing picked for today yet.</p>' +
-      '<div class="row"><button id="mkplan">Plan my day</button></div>');
-    $('mkplan').onclick = startDraft;
+    if (r.ok) lanes = (await r.json()).lanes || {};
+  } catch (e) { /* offline */ }
+  const cur = lanes.today || [];
+
+  if (cur.length){
+    // The day is already fixed. From here you report what happened and only
+    // that changes; you do not re-plan unless you ask for it.
+    todayShell('<h2>Today</h2>' +
+      cur.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
+        (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
+        '</div></div>').join('') +
+      '<textarea id="say" placeholder="what happened?"></textarea>' +
+      '<div class="row"><button id="upd">Update</button>' +
+      '<button id="mkplan" class="linkish">Re-plan the whole day</button></div>');
+    $('upd').onclick = sendUpdate;
+    $('mkplan').onclick = () => { CACHE.board = null; startDraft([], ''); };
+    $('say').addEventListener('keydown', e => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') sendUpdate();
+    });
     return;
   }
-  // The day is fixed. From here you do not re-plan, you report what happened
-  // and only that changes.
-  todayShell('<h2>Today</h2>' +
-    cur.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
-      (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
-      '</div></div>').join('') +
-    '<textarea id="say" placeholder="what happened? — finished the NDA, radiator is blocked till Tuesday, boiler guy coming at 3"></textarea>' +
-    '<div class="row"><button id="upd">Update</button>' +
-    '<button id="mkplan" class="linkish">Re-plan the whole day</button></div>');
-  $('upd').onclick = sendUpdate;
-  $('mkplan').onclick = startDraft;
+
+  // Fresh day. Everything you might pick is already on screen, unchecked,
+  // with a box and one button -- no round trip needed before you can say
+  // what the day is.
+  const pool = [].concat(lanes.in_progress || [], lanes.backlog || []);
+  let out = '<h2>Plan today</h2>';
+  if (!pool.length) out += '<p class="empty">Nothing in progress or backlog.</p>';
+  let lastLane = null;
+  for (const t of pool){
+    if (t.lane !== lastLane){
+      lastLane = t.lane;
+      out += '<div class="notpicked"><b>' + esc(LANE_LABEL[t.lane] || t.lane) + '</b></div>';
+    }
+    out += '<label class="pick"><input type="checkbox" value="' + esc(t.id) + '">' +
+           '<div><div class="t">' + esc(t.title) + '</div>' +
+           (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
+           '</div></label>';
+  }
+  out += '<textarea id="say" placeholder="anything else for today, or leave empty and let it choose"></textarea>' +
+         '<div class="row"><button id="mkplan">Plan my day</button></div>';
+  todayShell(out);
+  const go = () => startDraft(
+    Array.from(document.querySelectorAll('#today input[type=checkbox]'))
+         .filter(c => c.checked).map(c => c.value),
+    ($('say').value || '').trim());
+  $('mkplan').onclick = go;
   $('say').addEventListener('keydown', e => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') sendUpdate();
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') go();
   });
 }
 
-async function startDraft(){
+async function startDraft(selected, message){
   todayShell('<p class="spin">Thinking…</p>');
   try {
-    const r = await fetch('/plan/draft', {method:'POST', headers:H});
+    const r = await fetch('/plan/draft', {method:'POST',
+      headers:Object.assign({'Content-Type':'application/json'}, H),
+      body: JSON.stringify({selected: selected || [], message: message || ''})});
     if (!r.ok) throw new Error(await r.text());
     const d = await r.json();
     waitFor(d.job, j => { JOB = j; renderDraft(); });
@@ -684,7 +713,8 @@ function waitFor(jobId, onDone){
         clearInterval(POLL);
         todayShell('<p class="empty">planner failed — ' + esc(j.error || '') + '</p>' +
           '<div class="row"><button id="mkplan">Try again</button></div>');
-        $('mkplan').onclick = startDraft; return;
+        // Bare reference would hand the click event in as `selected`.
+        $('mkplan').onclick = () => renderToday(); return;
       }
       // Say how long it has been. A spinner with no number is how you end up
       // wondering whether the worker is even running.
@@ -715,8 +745,16 @@ function renderDraft(){
   const byTask = {};
   for (const m of (p.mutations || [])) (byTask[m.task_id] = byTask[m.task_id] || []).push(m);
 
+  // Tasks it is CREATING for today are part of the day too -- showing them
+  // only under "also changes" made the list look short and wrong.
+  const newToday = (p.mutations || []).filter(m => m.op === 'add' && m.lane === 'today');
   let out = '<h2>Today</h2>';
-  if (!p.today.length) out += '<p class="empty">It picked nothing. Tell it why that is wrong.</p>';
+  if (!p.today.length && !newToday.length)
+    out += '<p class="empty">It picked nothing. Tell it why that is wrong.</p>';
+  for (const m of newToday){
+    out += '<div class="pick"><div><div class="t">' + esc(m.title) + '</div>' +
+           '<div class="why">new task</div></div></div>';
+  }
   for (const i of p.today){
     out += '<label class="pick"><input type="checkbox" checked value="' + esc(i.task_id) + '">' +
            '<div><div class="t">' + esc(i.title) + '</div>' +
@@ -726,13 +764,15 @@ function renderDraft(){
   }
   // Mutations on tasks that are NOT in today still change the board, so they
   // must be visible rather than buried.
-  const other = (p.mutations || []).filter(m => !p.today.some(i => i.task_id === m.task_id));
+  const other = (p.mutations || []).filter(m =>
+    !(m.op === 'add' && m.lane === 'today') &&
+    !p.today.some(i => i.task_id === m.task_id));
   if (other.length) out += '<div class="notpicked"><b>Also changes:</b>' + other.map(mutLine).join('') + '</div>';
   if (p.notes) out += '<div class="notpicked">' + esc(p.notes) + '</div>';
   if ((JOB.rejected || []).length)
     out += '<div class="warn">dropped: ' + esc(JOB.rejected.join('; ')) + '</div>';
 
-  out += '<textarea id="say" placeholder="talk to it — what is wrong, what changed, what it missed"></textarea>' +
+  out += '<textarea id="say" placeholder="anything else it should know"></textarea>' +
          '<div class="row"><button id="accept">Accept</button>' +
          '<button id="again" class="linkish">Send</button>' +
          '<button id="nomut" class="linkish">Accept, skip changes</button></div>';

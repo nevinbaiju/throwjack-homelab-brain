@@ -46,7 +46,8 @@ OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append", "ad
 UPDATE_OPS = OPS | {"complete", "to_today", "from_today"}
 
 
-def build_context(conn, *, journal: str = "") -> dict:
+def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
+                  message: str = "") -> dict:
     """What the model gets to look at. Deliberately small.
 
     Everything here is already on the board -- this adds no new source of
@@ -80,13 +81,19 @@ def build_context(conn, *, journal: str = "") -> dict:
     chores = [{"id": r["id"], "title": r["title"]}
               for r in store.active_tasks(conn, "upkeep")]
 
-    return {
+    ctx = {
         "date": date.today().isoformat(),
         "cap": TODAY_CAP,
         "lanes": lanes,
         "chores_today": chores,
         "journal": journal[:2000],
     }
+    # What he ticked before pressing the button. Not a hint -- a decision.
+    if selected:
+        ctx["selected_by_user"] = [t for t in selected][:50]
+    if message:
+        ctx["user_says"] = message[:2000]
+    return ctx
 
 
 SYSTEM = f"""You plan one person's day. They have ADHD. You are choosing what
@@ -103,10 +110,20 @@ Reply with ONLY a JSON object, no prose, no code fence:
               {{"op":"note_append","task_id":"<id>","text":"<one line>"}}],
  "notes": "<max 40 words: what you changed and why>"}}
 
-WHEN THEY TELL YOU WHAT THE DAY IS, THAT IS THE ANSWER.
-They know their day. If they name what they are doing, put those things on
-the list. Do not argue, do not substitute your own priorities, and do not
-reply that you cannot do it.
+HOW TO READ THE INPUT. Three cases, and you are usually in the third:
+
+1. "selected_by_user" present -> those ids are DECISIONS, not suggestions.
+   Every one of them goes in "today". You order them and write the "why";
+   you do not drop any, and you do not add others unless asked.
+2. "user_says" present -> do what it says. If they name something that is
+   not a task yet, CREATE it with {{"op":"add"}}. Never reply that you cannot.
+3. Both present -> the ticked tasks are the day, and the text adds context
+   about them or names extra things to include. Honour both.
+4. Neither present -> nothing has been decided, so this is your call: look at
+   the lanes and chores_today and propose a sensible day.
+
+They know their day. Do not argue with it, do not substitute your own
+priorities, and never answer that something has no id.
 
 - If they name something that is NOT already a task, CREATE it with
   {{"op":"add", ...}}. Use lane "today" if it is for today. You do not need an
@@ -130,8 +147,10 @@ Otherwise, when they have not told you what the day is:
   finished. Decide each deliberately: keep it if today is still the day,
   otherwise set_lane it back. Carrying something a third day usually means
   the task is wrong, not the day -- say so in notes.
-- Never invent a task_id for an EXISTING thing. Use ids from the context, or
-  "add" for something genuinely new."""
+- Never invent a task_id. For something that does not exist yet, emit ONLY
+  {{"op":"add","lane":"today",...}} -- do NOT also put a made-up id in
+  "today". The add is what puts it on the day; a second invented id is
+  rejected and shows as a warning."""
 
 
 def validate(conn, raw: str) -> tuple[dict, list[str]]:

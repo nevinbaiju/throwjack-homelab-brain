@@ -432,7 +432,7 @@ async def board_json(authorization: str | None = Header(default=None),
                 "pinned": pinned, "status": r["status"],
             })
         return {"lanes": lanes,
-                "order": ["in_progress", "backlog", "waiting", "done"]}
+                "order": ["today", "in_progress", "backlog", "waiting", "done"]}
     finally:
         conn.close()
 
@@ -894,16 +894,26 @@ async def projects(authorization: str | None = Header(default=None),
 # is written. plan.validate() is the gate; the worker never touches the board.
 
 @app.post("/plan/draft")
-async def plan_draft(authorization: str | None = Header(default=None),
+async def plan_draft(payload: dict | None = None,
+        authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Ask for a fresh plan. Returns a job id to poll."""
+    """Ask for a plan. Optionally with tasks you already ticked and context.
+
+    Three shapes, all the same call: nothing (you decide), ticked tasks only
+    (order these), or ticked tasks plus text (these, and here is what else
+    matters). One button on the phone, one endpoint here.
+    """
     _require_auth(authorization, session)
     import store, plan
+    payload = payload or {}
+    selected = [str(x) for x in (payload.get("selected") or [])][:50]
+    message = str(payload.get("message", "")).strip()
     conn = store.connect()
     try:
-        ctx = plan.build_context(conn)
+        ctx = plan.build_context(conn, selected=selected, message=message)
         jid = plan.create_job(conn, "draft",
-                              {"system": plan.SYSTEM, "user": json.dumps(ctx)})
+                              {"system": plan.SYSTEM, "user": json.dumps(ctx)},
+                              message=message)
         conn.commit()
         return {"job": jid}
     finally:
