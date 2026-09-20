@@ -97,6 +97,27 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     n_items INTEGER,
     error   TEXT
 );
+
+-- Planning runs. A job is created when you ask for a plan; a worker on the
+-- host picks it up, calls Claude, and posts the result back. The job row is
+-- the whole conversation: raw model reply, the validated proposal, and what
+-- was rejected -- so a bad plan can be read back afterwards instead of being
+-- guessed at.
+CREATE TABLE IF NOT EXISTS plan_jobs (
+    id         TEXT PRIMARY KEY,
+    kind       TEXT NOT NULL,             -- draft | revise
+    state      TEXT NOT NULL,             -- pending | running | done | failed
+    context    TEXT NOT NULL,             -- JSON sent to the model
+    message    TEXT,                      -- your free text, on a revise
+    parent     TEXT,                      -- the job this one revises
+    raw        TEXT,                      -- model reply, verbatim
+    proposal   TEXT,                      -- validated JSON
+    rejected   TEXT,                      -- JSON list of what was dropped
+    error      TEXT,
+    applied_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 

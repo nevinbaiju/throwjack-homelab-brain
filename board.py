@@ -205,6 +205,15 @@ def intended_alarm(row, cfg: dict | None = None) -> datetime | None:
     promotion announcement. Everything that writes or audits a card must agree
     on this one answer.
     """
+    # Only Today carries alarms. Everything else is a card you can browse and
+    # drag on the phone, and nothing more. Alarms on backlog and in-progress
+    # were the bulk of the notification volume and none of the value: a nudge
+    # about something you already decided is not today's work is noise, and
+    # noise is what makes people mute the whole list. Deciding it here rather
+    # than at each call site means the audit in drift() agrees automatically.
+    if row["lane"] != "today":
+        return None
+
     at = alarm_time_for(row, cfg)
     if at is not None:
         return at

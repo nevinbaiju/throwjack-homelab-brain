@@ -72,6 +72,21 @@
      both without a breakpoint, and the wrapper widens only for these tabs so
      the composer keeps its comfortable reading measure. */
   .wrap.wide{max-width:1240px}
+  #today{display:none;flex:1;min-height:0;overflow-y:auto}
+  #today.on{display:block;max-width:640px;width:100%;margin:0 auto}
+  #today .pick{display:flex;gap:10px;align-items:flex-start;padding:12px 4px;
+    border-bottom:1px solid var(--line)}
+  /* 24px hit target minimum: this gets tapped one-handed, half asleep. */
+  #today .pick input{width:22px;height:22px;margin-top:2px;flex:none}
+  #today .pick .t{font-weight:600}
+  #today .pick .why{opacity:.72;font-size:.9em;margin-top:2px}
+  #today .mut{font-size:.85em;margin-top:4px;opacity:.85}
+  #today .mut b{font-weight:600}
+  #today .notpicked{opacity:.6;font-size:.9em;margin:14px 4px}
+  #today textarea{width:100%;min-height:76px;margin-top:14px}
+  #today .row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  #today .spin{opacity:.7;margin:18px 4px}
+  #today .warn{color:#b45309;font-size:.85em;margin:8px 4px}
   #board,#lists{display:none;flex:1;min-height:0;overflow-y:auto}
   #board.on,#lists.on{display:grid;gap:16px;align-items:start;
     grid-template-columns:repeat(auto-fit,minmax(272px,1fr))}
@@ -166,6 +181,7 @@
   <ul id="recent" aria-label="recent captures"></ul>
   <div id="board" aria-label="board"></div>
   <div id="lists" aria-label="lists"></div>
+  <div id="today" aria-label="today"></div>
 </div>
 
 <script>
@@ -177,7 +193,7 @@ let mode = 'file';
 
 $('kbd').textContent = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘↵ to send' : 'Ctrl+↵ to send';
 
-const TABS = {file:'m-file', plan:'m-plan', board:'m-board', upkeep:'m-upkeep', shop:'m-shop'};
+const TABS = {today:'m-today', file:'m-file', plan:'m-plan', board:'m-board', upkeep:'m-upkeep', shop:'m-shop'};
 
 function setMode(next){
   mode = next;
@@ -188,9 +204,11 @@ function setMode(next){
   for (const id of ['text','recent']) $(id).style.display = composing ? '' : 'none';
   document.querySelector('.bar').style.display = composing ? '' : 'none';
   document.querySelector('.wrap').classList.toggle('wide', !composing);
+  $('today').classList.toggle('on', next === 'today');
   $('board').classList.toggle('on', next === 'board');
   $('lists').classList.toggle('on', next === 'upkeep' || next === 'shop');
   $('lists').classList.toggle('one', next === 'upkeep');
+  if (next === 'today'){ renderToday(); return; }
   if (next === 'board'){ loadBoard(); return; }
   if (next === 'upkeep' || next === 'shop'){
     loadLists(next);
@@ -201,6 +219,7 @@ function setMode(next){
     : 'One thing. It lands on disk before anything reads it.';
   $('text').focus();
 }
+$('m-today').onclick = () => setMode('today');
 $('m-file').onclick = () => setMode('file');
 $('m-plan').onclick = () => setMode('plan');
 $('m-board').onclick = () => setMode('board');
@@ -593,4 +612,156 @@ document.addEventListener('keydown', e => {
   if((e.metaKey || e.ctrlKey) && e.key === 'Enter') { e.preventDefault(); send(); }
 });
 loadRecent(); loadProjects();
+// ----------------------------------------------------------------- today ---
+// Planning is on demand. Nothing is generated on a schedule, because a plan
+// that has been sitting there since morning is one you have already learned
+// to scroll past. You ask, it thinks for a few seconds, you argue with it,
+// and only then does anything move.
+let JOB = null;        // the draft under discussion
+let POLL = null;
+
+function todayShell(inner){ $('today').innerHTML = inner; }
+
+async function renderToday(){
+  if (JOB && JOB.proposal){ renderDraft(); return; }
+  // No draft in play: show what today already is, and the button.
+  let cur = [];
+  try {
+    const r = await fetch('/board.json', {headers:H});
+    if (r.ok){ const d = await r.json(); cur = (d.lanes && d.lanes.today) || []; }
+  } catch (e) { /* offline: the button still works */ }
+  todayShell(
+    (cur.length
+      ? '<h2>Today</h2>' + cur.map(t =>
+          '<div class="pick"><div><div class="t">' + esc(t.title) + '</div></div></div>').join('')
+      : '<p class="empty">Nothing picked for today yet.</p>') +
+    '<div class="row"><button id="mkplan">' +
+      (cur.length ? 'Re-plan my day' : 'Plan my day') + '</button></div>');
+  $('mkplan').onclick = startDraft;
+}
+
+async function startDraft(){
+  todayShell('<p class="spin">Thinking…</p>');
+  try {
+    const r = await fetch('/plan/draft', {method:'POST', headers:H});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    waitFor(d.job);
+  } catch (e) {
+    todayShell('<p class="empty">could not start — ' + esc(e.message) + '</p>');
+  }
+}
+
+function waitFor(jobId){
+  clearInterval(POLL);
+  const t0 = Date.now();
+  POLL = setInterval(async () => {
+    const secs = Math.round((Date.now() - t0) / 1000);
+    try {
+      const r = await fetch('/plan/job/' + encodeURIComponent(jobId), {headers:H});
+      if (!r.ok) throw new Error(await r.text());
+      const j = await r.json();
+      if (j.state === 'done'){
+        clearInterval(POLL); JOB = j; renderDraft(); return;
+      }
+      if (j.state === 'failed'){
+        clearInterval(POLL);
+        todayShell('<p class="empty">planner failed — ' + esc(j.error || '') + '</p>' +
+          '<div class="row"><button id="mkplan">Try again</button></div>');
+        $('mkplan').onclick = startDraft; return;
+      }
+      // Say how long it has been. A spinner with no number is how you end up
+      // wondering whether the worker is even running.
+      todayShell('<p class="spin">Thinking… ' + secs + 's</p>');
+    } catch (e) {
+      clearInterval(POLL);
+      todayShell('<p class="empty">lost the job — ' + esc(e.message) + '</p>');
+    }
+  }, 1000);
+}
+
+function mutLine(m){
+  if (m.op === 'retitle')
+    return '<div class="mut">↻ <b>retitle</b> — “' + esc(m.was || '') + '” → “' + esc(m.title) + '”</div>';
+  if (m.op === 'set_blocked')
+    return '<div class="mut">⛔ <b>blocked on</b> ' + esc(m.blocked_on) + '</div>';
+  if (m.op === 'clear_blocked')
+    return '<div class="mut">✓ <b>unblocked</b></div>';
+  if (m.op === 'set_lane')
+    return '<div class="mut">→ <b>move to</b> ' + esc(m.lane) + '</div>';
+  if (m.op === 'note_append')
+    return '<div class="mut">＋ <b>note</b> ' + esc(m.text) + '</div>';
+  return '';
+}
+
+function renderDraft(){
+  const p = JOB.proposal || {today:[], mutations:[], notes:''};
+  const byTask = {};
+  for (const m of (p.mutations || [])) (byTask[m.task_id] = byTask[m.task_id] || []).push(m);
+
+  let out = '<h2>Today</h2>';
+  if (!p.today.length) out += '<p class="empty">It picked nothing. Tell it why that is wrong.</p>';
+  for (const i of p.today){
+    out += '<label class="pick"><input type="checkbox" checked value="' + esc(i.task_id) + '">' +
+           '<div><div class="t">' + esc(i.title) + '</div>' +
+           '<div class="why">' + esc(i.why) + '</div>' +
+           (byTask[i.task_id] || []).map(mutLine).join('') +
+           '</div></label>';
+  }
+  // Mutations on tasks that are NOT in today still change the board, so they
+  // must be visible rather than buried.
+  const other = (p.mutations || []).filter(m => !p.today.some(i => i.task_id === m.task_id));
+  if (other.length) out += '<div class="notpicked"><b>Also changes:</b>' + other.map(mutLine).join('') + '</div>';
+  if (p.notes) out += '<div class="notpicked">' + esc(p.notes) + '</div>';
+  if ((JOB.rejected || []).length)
+    out += '<div class="warn">dropped: ' + esc(JOB.rejected.join('; ')) + '</div>';
+
+  out += '<textarea id="say" placeholder="talk to it — what is wrong, what changed, what it missed"></textarea>' +
+         '<div class="row"><button id="accept">Accept</button>' +
+         '<button id="again" class="linkish">Send</button>' +
+         '<button id="nomut" class="linkish">Accept, skip changes</button></div>';
+  todayShell(out);
+
+  $('accept').onclick = () => applyDraft(false);
+  $('nomut').onclick  = () => applyDraft(true);
+  $('again').onclick  = sendRevision;
+  $('say').addEventListener('keydown', e => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') sendRevision();
+  });
+}
+
+async function sendRevision(){
+  const msg = ($('say').value || '').trim();
+  if (!msg) { $('say').focus(); return; }
+  todayShell('<p class="spin">Rethinking…</p>');
+  try {
+    const r = await fetch('/plan/revise', {method:'POST',
+      headers:Object.assign({'Content-Type':'application/json'}, H),
+      body: JSON.stringify({parent: JOB.id, message: msg})});
+    if (!r.ok) throw new Error(await r.text());
+    const d = await r.json();
+    waitFor(d.job);
+  } catch (e) {
+    todayShell('<p class="empty">could not send — ' + esc(e.message) + '</p>');
+  }
+}
+
+async function applyDraft(skipMutations){
+  const accept = Array.from(document.querySelectorAll('#today input[type=checkbox]'))
+                      .filter(c => c.checked).map(c => c.value);
+  todayShell('<p class="spin">Applying…</p>');
+  try {
+    const r = await fetch('/plan/apply', {method:'POST',
+      headers:Object.assign({'Content-Type':'application/json'}, H),
+      body: JSON.stringify({job: JOB.id, accept: accept,
+                            skip_mutations: !!skipMutations})});
+    if (!r.ok) throw new Error(await r.text());
+    JOB = null;
+    CACHE.board = null;          // the board changed under it
+    renderToday();
+  } catch (e) {
+    todayShell('<p class="empty">could not apply — ' + esc(e.message) + '</p>');
+  }
+}
+
 </script>

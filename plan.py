@@ -105,6 +105,11 @@ Rules:
 - "mutations" may be empty. Only propose one when the board is actually wrong
   -- something in_progress that is really blocked, a title that no longer says
   what the next action is.
+- Items already in the "today" lane are yesterday's picks that were not
+  finished. Decide each one deliberately: keep it if today is still the day,
+  otherwise propose set_lane back to backlog or in_progress. Carrying
+  something for a third day usually means the task is wrong, not the day --
+  say so in notes.
 - Never invent a task_id. Use only ids present in the context."""
 
 
@@ -244,3 +249,84 @@ def apply(conn, proposal: dict) -> dict:
 
     return {"today": len(picked), "moved_in": moved_in,
             "moved_out": moved_out, "mutations": applied}
+
+
+# --------------------------------------------------------------- job queue ---
+# Claude Code runs on the host (that is where the subscription credential
+# lives); the brain runs in a container. Rather than opening a port on the
+# host that executes a model on request, the worker reaches IN: it polls for
+# jobs and posts results back, so nothing new listens anywhere.
+
+def create_job(conn, kind: str, context: dict, *, message: str = "",
+               parent: str | None = None) -> str:
+    import uuid
+    jid = "pj_" + uuid.uuid4().hex[:12]
+    now = store.now_iso()
+    conn.execute(
+        "INSERT INTO plan_jobs (id,kind,state,context,message,parent,created_at,updated_at)"
+        " VALUES (?,?,'pending',?,?,?,?,?)",
+        (jid, kind, json.dumps(context), message, parent, now, now))
+    return jid
+
+
+def claim_job(conn):
+    """Hand the oldest pending job to the worker, exactly once.
+
+    The UPDATE ... WHERE state='pending' is the claim: if two workers race,
+    one of them changes zero rows and gets nothing, rather than both running
+    the same plan and billing it twice.
+    """
+    row = conn.execute(
+        "SELECT * FROM plan_jobs WHERE state='pending' ORDER BY created_at LIMIT 1"
+    ).fetchone()
+    if row is None:
+        return None
+    cur = conn.execute(
+        "UPDATE plan_jobs SET state='running', updated_at=? WHERE id=? AND state='pending'",
+        (store.now_iso(), row["id"]))
+    return row if cur.rowcount else None
+
+
+def finish_job(conn, job_id: str, raw: str, proposal: dict, rejected: list) -> None:
+    conn.execute(
+        "UPDATE plan_jobs SET state='done', raw=?, proposal=?, rejected=?, updated_at=?"
+        " WHERE id=?",
+        (raw, json.dumps(proposal), json.dumps(rejected), store.now_iso(), job_id))
+
+
+def fail_job(conn, job_id: str, error: str) -> None:
+    conn.execute(
+        "UPDATE plan_jobs SET state='failed', error=?, updated_at=? WHERE id=?",
+        (error[:2000], store.now_iso(), job_id))
+
+
+def get_job(conn, job_id: str):
+    return conn.execute("SELECT * FROM plan_jobs WHERE id=?", (job_id,)).fetchone()
+
+
+def revise_context(conn, parent_row, message: str) -> dict:
+    """Context for a revision: the board as it is NOW, plus what was proposed
+    and what you said about it.
+
+    The board is re-read rather than reused from the parent job, because you
+    may have ticked something off on your phone between the draft and the
+    argument about it -- and a planner that reasons about a task you already
+    finished is one you stop believing.
+    """
+    ctx = build_context(conn)
+    try:
+        prev = json.loads(parent_row["proposal"] or "{}")
+    except ValueError:
+        prev = {}
+    ctx["previous_proposal"] = prev
+    ctx["user_says"] = message[:2000]
+    return ctx
+
+
+REVISE_SYSTEM = SYSTEM + """
+
+This is a REVISION. "previous_proposal" is what you last suggested and
+"user_says" is their reaction to it. They are the authority on their own day:
+if they say something is blocked, wrong, bigger than you thought, or simply
+not today, that is a fact, not an opinion to weigh. Re-emit the COMPLETE
+proposal, not a diff -- keep the parts they did not object to."""

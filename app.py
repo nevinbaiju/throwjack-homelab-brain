@@ -881,3 +881,170 @@ async def projects(authorization: str | None = Header(default=None),
                           "SELECT DISTINCT project FROM tasks WHERE project IS NOT NULL")})
     finally:
         conn.close()
+
+
+# ------------------------------------------------------------- planning ---
+# Today's action items. Generated only when asked -- there is no schedule,
+# because a plan waiting for you since 06:30 is a plan you have already
+# learned to ignore.
+#
+# The model runs on the host (that is where the subscription credential is),
+# so these endpoints are a queue: the phone creates a job, a host worker
+# claims it, and the result comes back here to be VALIDATED before anything
+# is written. plan.validate() is the gate; the worker never touches the board.
+
+@app.post("/plan/draft")
+async def plan_draft(authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Ask for a fresh plan. Returns a job id to poll."""
+    _require_auth(authorization, session)
+    import store, plan
+    conn = store.connect()
+    try:
+        ctx = plan.build_context(conn)
+        jid = plan.create_job(conn, "draft",
+                              {"system": plan.SYSTEM, "user": json.dumps(ctx)})
+        conn.commit()
+        return {"job": jid}
+    finally:
+        conn.close()
+
+
+@app.post("/plan/revise")
+async def plan_revise(payload: dict,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Argue with a draft. The board is re-read, not reused from the parent."""
+    _require_auth(authorization, session)
+    import store, plan
+    parent_id = str(payload.get("parent", ""))
+    message = str(payload.get("message", "")).strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    conn = store.connect()
+    try:
+        parent = plan.get_job(conn, parent_id)
+        if parent is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        ctx = plan.revise_context(conn, parent, message)
+        jid = plan.create_job(conn, "revise",
+                              {"system": plan.REVISE_SYSTEM, "user": json.dumps(ctx)},
+                              message=message, parent=parent_id)
+        conn.commit()
+        return {"job": jid}
+    finally:
+        conn.close()
+
+
+@app.get("/plan/job/{job_id}")
+async def plan_job(job_id: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Poll a job. The UI spins on this while the model runs."""
+    _require_auth(authorization, session)
+    import store, plan
+    conn = store.connect()
+    try:
+        row = plan.get_job(conn, job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        return {
+            "id": row["id"], "kind": row["kind"], "state": row["state"],
+            "message": row["message"], "parent": row["parent"],
+            "error": row["error"], "applied_at": row["applied_at"],
+            "proposal": json.loads(row["proposal"]) if row["proposal"] else None,
+            "rejected": json.loads(row["rejected"]) if row["rejected"] else [],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/plan/next")
+async def plan_next(authorization: str | None = Header(default=None)):
+    """Worker endpoint: claim the oldest pending job. Bearer token only."""
+    expected = f"Bearer {TOKEN}"
+    if not (authorization and secrets.compare_digest(authorization, expected)):
+        raise HTTPException(status_code=401, detail="bad token")
+    import store, plan
+    conn = store.connect()
+    try:
+        row = plan.claim_job(conn)
+        conn.commit()
+        if row is None:
+            return {}
+        return {"id": row["id"], "kind": row["kind"],
+                "context": json.loads(row["context"])}
+    finally:
+        conn.close()
+
+
+@app.post("/plan/job/{job_id}/result")
+async def plan_result(job_id: str, payload: dict,
+        authorization: str | None = Header(default=None)):
+    """Worker endpoint: hand back the model's reply.
+
+    Validation happens HERE, not in the worker. The worker is on the host and
+    is deliberately dumb; letting it decide what counts as a valid plan would
+    move the gate outside the process that owns the database.
+    """
+    expected = f"Bearer {TOKEN}"
+    if not (authorization and secrets.compare_digest(authorization, expected)):
+        raise HTTPException(status_code=401, detail="bad token")
+    import store, plan
+    conn = store.connect()
+    try:
+        row = plan.get_job(conn, job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        if payload.get("error"):
+            plan.fail_job(conn, job_id, str(payload["error"]))
+            conn.commit()
+            return {"ok": True, "state": "failed"}
+        raw = str(payload.get("raw", ""))
+        proposal, rejected = plan.validate(conn, raw)
+        plan.finish_job(conn, job_id, raw, proposal, rejected)
+        conn.commit()
+        return {"ok": True, "state": "done",
+                "today": len(proposal["today"]), "rejected": len(rejected)}
+    finally:
+        conn.close()
+
+
+@app.post("/plan/apply")
+async def plan_apply(payload: dict, background: BackgroundTasks,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Commit a draft. Nothing before this point has changed the board."""
+    _require_auth(authorization, session)
+    import store, plan
+    job_id = str(payload.get("job", ""))
+    conn = store.connect()
+    try:
+        row = plan.get_job(conn, job_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        if row["state"] != "done" or not row["proposal"]:
+            raise HTTPException(status_code=409, detail="job is not ready")
+        if row["applied_at"]:
+            raise HTTPException(status_code=409, detail="already applied")
+        proposal = json.loads(row["proposal"])
+        # The phone may send back a subset: items you unticked are simply not
+        # in the list. Honour that -- you are the authority on your own day.
+        keep = payload.get("accept")
+        if isinstance(keep, list):
+            keep = set(keep)
+            proposal["today"] = [i for i in proposal["today"] if i["task_id"] in keep]
+        drop = payload.get("skip_mutations")
+        if drop:
+            proposal["mutations"] = []
+        result = plan.apply(conn, proposal)
+        conn.execute("UPDATE plan_jobs SET applied_at=?, updated_at=? WHERE id=?",
+                     (store.now_iso(), store.now_iso(), job_id))
+        conn.commit()
+    finally:
+        conn.close()
+    # Project it to the phone now rather than at the next timer tick: you just
+    # decided what today is, and the list should exist before you put the
+    # phone down.
+    background.add_task(run_triage_once)
+    return {"ok": True, **result}

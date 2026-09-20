@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Host-side worker: runs the planning model for the brain.
+
+Claude Code's subscription credential lives on the host, in this user's
+keyring; the brain runs in a container. Rather than opening a port on the host
+that executes a model on request -- a listening socket that runs an LLM, on a
+machine whose firewall still has a wide port range open -- this worker reaches
+IN. It polls the brain for queued jobs and posts results back. Nothing new
+listens anywhere, and the credential never enters a container.
+
+It is deliberately dumb: the brain supplies both the system prompt and the
+user payload in the job, so there is no prompt logic here to drift out of sync
+with the version running in the container. This process only knows how to run
+a prompt and hand back the reply.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+BRAIN = os.environ.get("BRAIN_URL", "http://127.0.0.1:5010").rstrip("/")
+TOKEN = os.environ.get("BRAIN_TOKEN", "")
+CLAUDE = os.environ.get("CLAUDE_BIN", os.path.expanduser("~/.local/bin/claude"))
+# Poll fast: planning is on-demand, so this interval is how long a tap on the
+# phone sits doing nothing before work starts. It is a loopback GET.
+IDLE = float(os.environ.get("BRAIN_POLL_SEC", "1.0"))
+TIMEOUT = int(os.environ.get("BRAIN_CLAUDE_TIMEOUT", "180"))
+
+# No tools. This is a text-to-JSON transform and nothing else; the model has
+# no business touching the filesystem or the network from here, and denying it
+# also strips a few thousand tokens of tool preamble from every call.
+NO_TOOLS = ["Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch",
+            "Glob", "Grep", "Task", "TodoWrite", "NotebookEdit"]
+
+
+def api(path: str, payload: dict | None = None, method: str | None = None):
+    req = urllib.request.Request(
+        f"{BRAIN}{path}",
+        data=json.dumps(payload).encode() if payload is not None else None,
+        method=method or ("POST" if payload is not None else "GET"),
+        headers={"Authorization": f"Bearer {TOKEN}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "brain-planner/1"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = r.read().decode()
+    return json.loads(body) if body.strip() else {}
+
+
+def run_claude(system: str, user: str, mcp_path: str) -> str:
+    p = subprocess.run(
+        [CLAUDE, "-p", user,
+         "--append-system-prompt", system,
+         "--disallowed-tools", *NO_TOOLS,
+         "--strict-mcp-config", "--mcp-config", mcp_path,
+         "--output-format", "json"],
+        capture_output=True, text=True, timeout=TIMEOUT)
+    if p.returncode != 0:
+        raise RuntimeError(f"claude exited {p.returncode}: {p.stderr[:500]}")
+    env = json.loads(p.stdout)
+    if env.get("is_error"):
+        raise RuntimeError(f"claude reported an error: {str(env.get('result'))[:500]}")
+    return env.get("result", "")
+
+
+def main() -> None:
+    if not TOKEN:
+        sys.exit("BRAIN_TOKEN is required — refusing to start without auth")
+    if not os.path.exists(CLAUDE):
+        sys.exit(f"claude not found at {CLAUDE}; set CLAUDE_BIN")
+
+    tmp = tempfile.mkdtemp(prefix="brain-planner-")
+    mcp = os.path.join(tmp, "mcp.json")
+    with open(mcp, "w") as f:
+        f.write('{"mcpServers":{}}')
+
+    print(f"brain-planner: polling {BRAIN} every {IDLE}s", flush=True)
+    warned = False
+    while True:
+        try:
+            job = api("/plan/next")
+            warned = False
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            # The brain restarts; that is normal and not worth a stack trace
+            # every second. Say it once, then go quiet until it comes back.
+            if not warned:
+                print(f"brain unreachable ({e}); retrying", file=sys.stderr, flush=True)
+                warned = True
+            time.sleep(min(IDLE * 5, 10))
+            continue
+
+        if not job or not job.get("id"):
+            time.sleep(IDLE)
+            continue
+
+        jid = job["id"]
+        print(f"job {jid} ({job.get('kind')})", flush=True)
+        t0 = time.time()
+        try:
+            ctx = job.get("context") or {}
+            raw = run_claude(ctx.get("system", ""), ctx.get("user", ""), mcp)
+            api(f"/plan/job/{jid}/result", {"raw": raw})
+            print(f"  done in {time.time()-t0:.1f}s", flush=True)
+        except Exception as e:                       # noqa: BLE001
+            # Any failure must reach the job row, or the phone spins forever
+            # waiting for a result that is never coming.
+            msg = f"{type(e).__name__}: {e}"
+            print(f"  failed: {msg}", file=sys.stderr, flush=True)
+            try:
+                api(f"/plan/job/{jid}/result", {"error": msg})
+            except Exception:                        # noqa: BLE001
+                pass
+
+
+if __name__ == "__main__":
+    main()
