@@ -20,6 +20,12 @@ import store
 
 # Lane key -> (collection, display name). Order is the board order.
 LANES: dict[str, tuple[str, str]] = {
+    # Today is a real lane, not a view: a task picked for today MOVES here, so
+    # the phone shows one short list rather than a flag buried in a long one.
+    # The cost of a real lane is knowing where a task came from when it is
+    # unpicked -- solved by tasks.prev_lane, set on the way in and restored on
+    # the way out, so nothing has to guess.
+    "today":       ("today", "Today"),
     "backlog":     ("backlog", "Backlog"),
     "in_progress": ("in-progress", "In Progress"),
     "done":        ("done", "Done"),

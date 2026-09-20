@@ -123,6 +123,10 @@ MIGRATIONS = [
     ("tasks", "source_key", "TEXT"),
     ("tasks", "escalations", "INTEGER"),
     ("tasks", "last_alarm_at", "TEXT"),
+    # Where a task was before it was picked for Today, so unpicking restores it
+    # exactly instead of dumping everything into Backlog. Set when entering the
+    # today lane, consumed and cleared when leaving it.
+    ("tasks", "prev_lane", "TEXT"),
 ]
 
 
