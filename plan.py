@@ -34,15 +34,16 @@ def _is_chore(row) -> bool:
     return str(row["id"]).startswith("u_") or row["track"] == "upkeep"
 
 
-# Ops a DRAFT may propose. A draft is choosing the day; it has no business
-# completing things or inventing tasks.
-OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append"}
+# Ops a DRAFT may propose. It may create tasks: planning a day routinely
+# means naming things that are not on the board yet ("today I'm cooking, doing
+# Costco, and pushing the Glacier work"). Refusing that made the planner
+# answer "I can't create them, so today stays empty", which is useless.
+# It still may not COMPLETE anything -- that is mid-day news, not a plan.
+OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append", "add"}
 
-# Ops an UPDATE may additionally propose. Mid-day reality is different: things
-# get finished, things appear, things fall off. "add" is here because "the
-# boiler guy is coming at 3" is a real thing that happened to your day and
-# making you go and file it separately is how a plan stops matching the day.
-UPDATE_OPS = OPS | {"complete", "to_today", "from_today", "add"}
+# Ops an UPDATE may additionally propose. Mid-day reality is different:
+# things get finished and things fall off a day already in motion.
+UPDATE_OPS = OPS | {"complete", "to_today", "from_today"}
 
 
 def build_context(conn, *, journal: str = "") -> dict:
@@ -94,31 +95,43 @@ goes on today's list and nothing else.
 Reply with ONLY a JSON object, no prose, no code fence:
 
 {{"today":    [{{"task_id":"<id>","why":"<max 12 words>"}}],
- "mutations":[{{"op":"set_lane","task_id":"<id>","lane":"backlog|in_progress"}},
+ "mutations":[{{"op":"add","title":"<new task>","lane":"today|backlog","note":"<optional>"}},
+              {{"op":"set_lane","task_id":"<id>","lane":"backlog|in_progress"}},
               {{"op":"set_blocked","task_id":"<id>","blocked_on":"<who or what>"}},
               {{"op":"clear_blocked","task_id":"<id>"}},
               {{"op":"retitle","task_id":"<id>","title":"<new title>"}},
               {{"op":"note_append","task_id":"<id>","text":"<one line>"}}],
  "notes": "<max 40 words: what you changed and why>"}}
 
-Rules:
-- At most {TODAY_CAP} items in "today". Fewer is better than more. A list that
-  cannot be finished is worse than a short one.
-- Prefer things already in_progress over starting something new. Finishing
-  beats starting.
+WHEN THEY TELL YOU WHAT THE DAY IS, THAT IS THE ANSWER.
+They know their day. If they name what they are doing, put those things on
+the list. Do not argue, do not substitute your own priorities, and do not
+reply that you cannot do it.
+
+- If they name something that is NOT already a task, CREATE it with
+  {{"op":"add", ...}}. Use lane "today" if it is for today. You do not need an
+  existing id, and "it has no id" is never a reason to leave the day empty.
+- Chores from chores_today CAN be today's items. Put their ids in "today"
+  like anything else -- a Sunday that is cooking and a Costco run is a real
+  day. You may not mutate them; referencing one is not mutating it.
+- Change ONLY what they asked for. If they gave you instructions, do not
+  volunteer unrelated tidying of the board. A mutation they did not ask for
+  is noise at best.
+
+Otherwise, when they have not told you what the day is:
+- At most {TODAY_CAP} items. Fewer is better than more.
+- Prefer finishing what is in_progress over starting something new.
 - Anything blocked_on someone else does not belong in today unless the action
   IS chasing them.
-- Chores in chores_today already consume the day. Account for them; never
-  propose mutations for them.
-- "mutations" may be empty. Only propose one when the board is actually wrong
-  -- something in_progress that is really blocked, a title that no longer says
-  what the next action is.
+- Propose a mutation only when the board is actually wrong -- something
+  in_progress that is really blocked, a title that no longer names the next
+  action.
 - Items already in the "today" lane are yesterday's picks that were not
-  finished. Decide each one deliberately: keep it if today is still the day,
-  otherwise propose set_lane back to backlog or in_progress. Carrying
-  something for a third day usually means the task is wrong, not the day --
-  say so in notes.
-- Never invent a task_id. Use only ids present in the context."""
+  finished. Decide each deliberately: keep it if today is still the day,
+  otherwise set_lane it back. Carrying something a third day usually means
+  the task is wrong, not the day -- say so in notes.
+- Never invent a task_id for an EXISTING thing. Use ids from the context, or
+  "add" for something genuinely new."""
 
 
 def validate(conn, raw: str) -> tuple[dict, list[str]]:
@@ -148,13 +161,15 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
         row = rows.get(tid)
         if row is None:
             rejected.append(f"unknown task_id {tid!r}"); continue
-        if _is_chore(row):
-            rejected.append(f"{tid} is a chore; iOS owns it"); continue
         if tid in seen:
             continue
         seen.add(tid)
         today.append({"task_id": tid, "title": row["title"],
-                      "why": str(item.get("why", ""))[:120]})
+                      "why": str(item.get("why", ""))[:120],
+                      # A chore in today is a REFERENCE. iOS owns its
+                      # recurrence and completion, so apply() must not move it
+                      # out of the Upkeep list -- it just appears on the day.
+                      "is_chore": _is_chore(row)})
     if len(today) > TODAY_CAP:
         rejected.append(f"proposed {len(today)} items; capped at {TODAY_CAP}")
         today = today[:TODAY_CAP]
@@ -181,7 +196,10 @@ def apply(conn, proposal: dict) -> dict:
     recorded on the way in -- that is the whole reason the column exists.
     """
     now = store.now_iso()
-    picked = {i["task_id"] for i in proposal.get("today", [])}
+    # Chores are referenced, never moved: iOS owns the Upkeep list and its
+    # recurrence. They show on the day; their lane is not ours to change.
+    picked = {i["task_id"] for i in proposal.get("today", [])
+              if not i.get("is_chore")}
     moved_in = moved_out = 0
 
     for row in store.active_tasks(conn, "today"):
@@ -204,7 +222,15 @@ def apply(conn, proposal: dict) -> dict:
 
     applied = 0
     for m_ in proposal.get("mutations", []):
-        tid, op = m_["task_id"], m_["op"]
+        op = m_["op"]
+        if op == "add":
+            new_id = store.create_task(conn, title=m_["title"], note=m_.get("note", ""),
+                                       track="focus", lane=m_["lane"])
+            if m_["lane"] == "today":
+                conn.execute("UPDATE tasks SET prev_lane='backlog' WHERE id=?", (new_id,))
+            applied += 1
+            continue
+        tid = m_["task_id"]
         if op == "set_lane":
             # Never clobber prev_lane for a task sitting in today: it is what
             # sends the task home later.
