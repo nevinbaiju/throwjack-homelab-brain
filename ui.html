@@ -157,6 +157,7 @@
   </header>
 
   <div class="modes" role="tablist">
+    <button role="tab" id="m-today" aria-selected="false">Today</button>
     <button role="tab" id="m-file" aria-selected="true">File task</button>
     <button role="tab" id="m-plan" aria-selected="false">Plan task</button>
     <button role="tab" id="m-board" aria-selected="false">Board</button>
@@ -198,7 +199,11 @@ const TABS = {today:'m-today', file:'m-file', plan:'m-plan', board:'m-board', up
 function setMode(next){
   mode = next;
   const composing = next === 'file' || next === 'plan';
-  for (const [k, id] of Object.entries(TABS)) $(id).setAttribute('aria-selected', k === next);
+  // Guarded: a tab button that is not in the markup must not take the
+  // whole page down with it.
+  for (const [k, id] of Object.entries(TABS)){
+    const el = $(id); if (el) el.setAttribute('aria-selected', k === next);
+  }
   $('slugrow').classList.toggle('on', next === 'plan');
   // The composer, the board and the lists share the column; one at a time.
   for (const id of ['text','recent']) $(id).style.display = composing ? '' : 'none';
@@ -219,12 +224,11 @@ function setMode(next){
     : 'One thing. It lands on disk before anything reads it.';
   $('text').focus();
 }
-$('m-today').onclick = () => setMode('today');
-$('m-file').onclick = () => setMode('file');
-$('m-plan').onclick = () => setMode('plan');
-$('m-board').onclick = () => setMode('board');
-$('m-upkeep').onclick = () => setMode('upkeep');
-$('m-shop').onclick = () => setMode('shop');
+for (const [name, id] of Object.entries(TABS)){
+  const el = $(id);
+  if (el) el.onclick = () => setMode(name);
+  else console.warn('tab button missing:', id);
+}
 
 const LANE_LABEL = {in_progress:'In progress', backlog:'Backlog', waiting:'Waiting', done:'Done'};
 
