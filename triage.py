@@ -215,18 +215,28 @@ def rescore_and_sync(conn, summary: dict | None = None) -> dict:
     card would burn a CalDAV round trip and wake every synced device.
     """
     out = {"repriced": 0, "carded": 0}
-    before = {r["id"]: board._priority(r["score"] or 0.0)
-              for r in store.active_tasks(conn)}
     rescore(conn)
-    for row in store.active_tasks(conn):
-        tid = row["id"]
-        now_bucket = board._priority(row["score"] or 0.0)
-        was = before.get(tid)
-        if was == now_bucket:
-            continue
+    # Push whatever does not match, rather than whatever changed price.
+    #
+    # This used to compare each task's priority bucket before and after
+    # rescore and push only on a change. That answers "did the score move",
+    # when the question is "does the card on the phone still match the
+    # database". A lane move does not touch the score, so accepting a plan
+    # wrote `today` into SQLite and never created the cards -- and a task
+    # created at score 0 sits at bucket 9 before and after, so it could never
+    # be pushed at all. The two compounded: every planner-created task was
+    # permanently invisible on the phone.
+    #
+    # board.audit() already computes exactly the right comparison -- lane,
+    # priority, alarm, and cards that do not exist -- with one multiget per
+    # lane, so this is also how a failed push from an earlier pass finally
+    # gets retried.
+    for problem in board.audit(conn):
+        tid = problem["id"]
         try:
             project_to_board(conn, tid)
-            out["carded" if was is None else "repriced"] += 1
+            out["carded" if problem.get("problem") == "missing from the board"
+                else "repriced"] += 1
         except caldav.CalDavError as e:
             print(f"[triage] board push failed for {tid}: {e}", flush=True)
     if summary is not None:

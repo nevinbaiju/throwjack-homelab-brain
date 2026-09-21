@@ -111,7 +111,8 @@ goes on today's list and nothing else.
 Reply with ONLY a JSON object, no prose, no code fence:
 
 {{"today":    [{{"task_id":"<id>","why":"<max 12 words>"}}],
- "mutations":[{{"op":"add","title":"<new task>","lane":"today|backlog","note":"<optional>"}},
+ "mutations":[{{"op":"add","title":"<new task>","lane":"today|backlog",
+               "consequence":"breaks|costs|improves|optional","note":"<optional>"}},
               {{"op":"set_lane","task_id":"<id>","lane":"backlog|in_progress"}},
               {{"op":"set_blocked","task_id":"<id>","blocked_on":"<who or what>"}},
               {{"op":"clear_blocked","task_id":"<id>"}},
@@ -165,6 +166,10 @@ Otherwise, when they have not told you what the day is:
   finished. Decide each deliberately: keep it if today is still the day,
   otherwise set_lane it back. Carrying something a third day usually means
   the task is wrong, not the day -- say so in notes.
+- Every "add" needs a "consequence": what happens if it is never done.
+  breaks = something fails or a deadline is missed, costs = money, time or
+  goodwill, improves = better if done, optional = nice to have. It sets the
+  task's priority on his phone; omitting it buries the task at the bottom.
 - Groceries and shopping go on a LIST, not on the board. "add paneer to the
   costco list" is {{"op":"list_add","list":"shop-costco","items":["paneer"]}},
   never a task. Use only keys present in "shopping_lists".
@@ -341,7 +346,8 @@ def apply(conn, proposal: dict) -> dict:
             continue
         if op == "add":
             new_id = store.create_task(conn, title=m_["title"], note=m_.get("note", ""),
-                                       track="focus", lane=m_["lane"])
+                                       track="focus", lane=m_["lane"],
+                                       consequence=m_.get("consequence", "costs"))
             if m_["lane"] == "today":
                 conn.execute("UPDATE tasks SET prev_lane='backlog' WHERE id=?", (new_id,))
             applied += 1
@@ -548,7 +554,15 @@ def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
         lane = str(m.get("lane", "backlog"))
         if lane not in ("today", "backlog", "in_progress"):
             lane = "backlog"
-        return {"op": "add", "title": title, "lane": lane,
+        # Without a consequence the task scores 0, which is PRIORITY 9 on the
+        # phone -- the bottom of every list. Tasks that arrive through capture
+        # get this classified by the triage model; ones created here bypass
+        # that, so the planner supplies it and anything unrecognised lands
+        # mid-scale rather than at the floor.
+        cq = str(m.get("consequence", "")).strip().lower()
+        if cq not in ("breaks", "costs", "improves", "optional"):
+            cq = "costs"
+        return {"op": "add", "title": title, "lane": lane, "consequence": cq,
                 "note": str(m.get("note", ""))[:500]}, None
 
     tid = str(m.get("task_id", ""))
@@ -666,7 +680,7 @@ def apply_update(conn, proposal: dict) -> dict:
             # the inbox to be classified by a model that knows less than you.
             new_id = store.create_task(
                 conn, title=m["title"], note=m["note"], track="focus",
-                lane=lane)
+                lane=lane, consequence=m.get("consequence", "costs"))
             if lane == "today":
                 conn.execute("UPDATE tasks SET prev_lane='backlog' WHERE id=?", (new_id,))
             done.append(f"added “{m['title']}” to {lane}")
