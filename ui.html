@@ -744,6 +744,10 @@ function mutLine(m){
     return '<div class="mut">→ <b>move to</b> ' + esc(m.lane) + '</div>';
   if (m.op === 'note_append')
     return '<div class="mut">＋ <b>note</b> ' + esc(m.text) + '</div>';
+  if (m.op === 'list_add')
+    return '<div class="mut">🛒 <b>' + esc(m.label) + '</b> — ' + esc((m.items||[]).join(', ')) + '</div>';
+  if (m.op === 'complete')
+    return '<div class="mut">✓ <b>done</b> — ' + esc(m.title || m.task_id) + '</div>';
   return '';
 }
 
@@ -853,6 +857,7 @@ function updLine(m){
   if (m.op === 'retitle')     return '↻ “' + esc(m.was || '') + '” → “' + esc(m.title) + '”';
   if (m.op === 'set_lane')    return '→ ' + esc(m.lane) + ' — ' + esc(m.title || m.task_id);
   if (m.op === 'note_append') return '＋ note — ' + esc(m.text);
+  if (m.op === 'list_add')    return '🛒 ' + esc(m.label) + ' — ' + esc((m.items||[]).join(', '));
   return esc(m.op);
 }
 

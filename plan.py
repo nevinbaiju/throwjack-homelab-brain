@@ -42,7 +42,7 @@ def _is_chore(row) -> bool:
 # yesterday's carried items are actually finished, and refusing that forced
 # them BACK onto today -- the opposite of what was meant.
 OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append",
-       "add", "complete"}
+       "add", "complete", "list_add"}
 
 # Ops an UPDATE may additionally propose. Mid-day reality is different:
 # things get finished and things fall off a day already in motion.
@@ -84,11 +84,17 @@ def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
     chores = [{"id": r["id"], "title": r["title"]}
               for r in store.active_tasks(conn, "upkeep")]
 
+    # Shopping lists live only in CalDAV; they are not rows in tasks. Unless
+    # they are named here, "add paneer to the costco list" becomes a backlog
+    # task called "Costco list: paneer" instead of two items on the list.
+    shops = _shopping_collections()
+
     ctx = {
         "date": date.today().isoformat(),
         "cap": TODAY_CAP,
         "lanes": lanes,
         "chores_today": chores,
+        "shopping_lists": shops,
         "journal": journal[:2000],
     }
     # What he ticked before pressing the button. Not a hint -- a decision.
@@ -110,7 +116,9 @@ Reply with ONLY a JSON object, no prose, no code fence:
               {{"op":"set_blocked","task_id":"<id>","blocked_on":"<who or what>"}},
               {{"op":"clear_blocked","task_id":"<id>"}},
               {{"op":"retitle","task_id":"<id>","title":"<new title>"}},
-              {{"op":"note_append","task_id":"<id>","text":"<one line>"}}],
+              {{"op":"note_append","task_id":"<id>","text":"<one line>"}},
+              {{"op":"list_add","list":"<key from shopping_lists>","items":["<item>",...]}},
+              {{"op":"complete","task_id":"<id>"}}],
  "notes": "<max 40 words: what you changed and why>"}}
 
 HOW TO READ THE INPUT. Three cases, and you are usually in the third:
@@ -157,6 +165,13 @@ Otherwise, when they have not told you what the day is:
   finished. Decide each deliberately: keep it if today is still the day,
   otherwise set_lane it back. Carrying something a third day usually means
   the task is wrong, not the day -- say so in notes.
+- Groceries and shopping go on a LIST, not on the board. "add paneer to the
+  costco list" is {{"op":"list_add","list":"shop-costco","items":["paneer"]}},
+  never a task. Use only keys present in "shopping_lists".
+- A task that is mostly finished with one piece left is not done. Retitle it
+  to name the piece that remains, note_append what is already done, and
+  set_lane it wherever it actually belongs -- backlog if it is waiting for a
+  weekend or a person.
 - Never invent a task_id. For something that does not exist yet, emit ONLY
   {{"op":"add","lane":"today",...}} -- do NOT also put a made-up id in
   "today". The add is what puts it on the day; a second invented id is
@@ -311,6 +326,19 @@ def apply(conn, proposal: dict) -> dict:
     applied = 0
     for m_ in proposal.get("mutations", []):
         op = m_["op"]
+        if op == "list_add":
+            # Shopping items are plain VTODOs in their own collection, the
+            # same thing the web form creates. The brain does not track them
+            # as tasks -- iOS owns those lists.
+            import caldav, uuid as _uuid
+            for item in m_["items"]:
+                uid = f"g_{_uuid.uuid4().hex[:12]}"
+                try:
+                    caldav.put_todo(m_["list"], uid, caldav.build_vtodo(uid, item))
+                except Exception as e:                       # noqa: BLE001
+                    print(f"[plan] list_add {m_['list']}/{item}: {e}", flush=True)
+            applied += 1
+            continue
         if op == "add":
             new_id = store.create_task(conn, title=m_["title"], note=m_.get("note", ""),
                                        track="focus", lane=m_["lane"])
@@ -481,6 +509,17 @@ Rules:
   list and say why in notes."""
 
 
+def _shopping_collections() -> dict[str, str]:
+    """Live shopping collections, discovered rather than hardcoded."""
+    try:
+        import caldav
+        return {c["collection"]: c.get("label") or c["collection"]
+                for c in caldav.list_collections()
+                if c["collection"].startswith("shop-")}
+    except Exception:                                        # noqa: BLE001
+        return {}
+
+
 def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
     """One mutation -> (clean mutation, rejection reason). Shared by both
     paths, because two copies of this would drift and the drifted one would
@@ -490,6 +529,17 @@ def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
     op = str(m.get("op", ""))
     if op not in allowed:
         return None, f"unknown or disallowed op {op!r}"
+
+    if op == "list_add":
+        coll = str(m.get("list", ""))
+        shops = _shopping_collections()
+        if coll not in shops:
+            return None, f"no shopping list {coll!r} (have: {', '.join(sorted(shops)) or 'none'})"
+        items = [str(i).strip()[:255] for i in (m.get("items") or []) if str(i).strip()]
+        if not items:
+            return None, f"list_add to {coll} with no items"
+        return {"op": "list_add", "list": coll, "label": shops[coll],
+                "items": items[:40]}, None
 
     if op == "add":
         title = str(m.get("title", "")).strip()[:200]
@@ -595,6 +645,19 @@ def apply_update(conn, proposal: dict) -> dict:
                 slugs.add(slug)
                 events.append((slug, f"**{op}** `{tid}` — {m.get('title', '')}"))
 
+        if op == "list_add":
+            # Shopping items are plain VTODOs in their own collection, the
+            # same thing the web form creates. The brain does not track them
+            # as tasks -- iOS owns those lists.
+            import caldav, uuid as _uuid
+            for item in m["items"]:
+                uid = f"g_{_uuid.uuid4().hex[:12]}"
+                try:
+                    caldav.put_todo(m["list"], uid, caldav.build_vtodo(uid, item))
+                except Exception as e:                       # noqa: BLE001
+                    print(f"[plan] list_add {m['list']}/{item}: {e}", flush=True)
+            done.append(f"added {len(m['items'])} to {m['label']}")
+            continue
         if op == "add":
             lane = m["lane"]
             # Straight into the lane asked for. Capture would normally triage
