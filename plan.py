@@ -38,12 +38,15 @@ def _is_chore(row) -> bool:
 # means naming things that are not on the board yet ("today I'm cooking, doing
 # Costco, and pushing the Glacier work"). Refusing that made the planner
 # answer "I can't create them, so today stays empty", which is useless.
-# It still may not COMPLETE anything -- that is mid-day news, not a plan.
-OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append", "add"}
+# It may also complete: the commonest thing to say while planning is that
+# yesterday's carried items are actually finished, and refusing that forced
+# them BACK onto today -- the opposite of what was meant.
+OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append",
+       "add", "complete"}
 
 # Ops an UPDATE may additionally propose. Mid-day reality is different:
 # things get finished and things fall off a day already in motion.
-UPDATE_OPS = OPS | {"complete", "to_today", "from_today"}
+UPDATE_OPS = OPS | {"to_today", "from_today"}
 
 
 def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
@@ -112,13 +115,20 @@ Reply with ONLY a JSON object, no prose, no code fence:
 
 HOW TO READ THE INPUT. Three cases, and you are usually in the third:
 
-1. "selected_by_user" present -> those ids are DECISIONS, not suggestions.
-   Every one of them goes in "today". You order them and write the "why";
-   you do not drop any, and you do not add others unless asked.
+1. "selected_by_user" present -> they have pointed at those exact tasks.
+   What to DO with them comes from "user_says". Read it first:
+     - says they are finished / done / already did them
+         -> {{"op":"complete"}} for each. Do NOT put them in "today".
+     - says to push them / not today / drop them
+         -> {{"op":"set_lane"}} back to backlog or in_progress.
+     - says nothing about them, or says to do them
+         -> they ARE the day: every one goes in "today", ordered, with a why.
+   Either way none of them may be ignored, and do not add others unless asked.
 2. "user_says" present -> do what it says. If they name something that is
    not a task yet, CREATE it with {{"op":"add"}}. Never reply that you cannot.
-3. Both present -> the ticked tasks are the day, and the text adds context
-   about them or names extra things to include. Honour both.
+3. Both present -> the text says what to do with the ticked tasks, and may
+   also name extra things to include. Honour both. This is the common case:
+   "these two are done" or "these two plus a Costco run".
 4. Neither present -> nothing has been decided, so this is your call: look at
    the lanes and chores_today and propose a sensible day.
 
@@ -264,6 +274,11 @@ def apply(conn, proposal: dict) -> dict:
     picked = {i["task_id"] for i in proposal.get("today", [])
               if not i.get("is_chore")}
     moved_in = moved_out = 0
+    # Completions run first: if you ticked a carried item to say it is
+    # finished, it must leave the day rather than be re-selected into it.
+    for m_ in proposal.get("mutations", []):
+        if m_["op"] == "complete":
+            picked.discard(m_.get("task_id"))
     # A lane move changes which bucket the task occupies in its project's
     # STATE.md, so selection alone is enough to make that folder stale.
     slugs: set[str] = set()
@@ -324,6 +339,14 @@ def apply(conn, proposal: dict) -> dict:
                 "UPDATE tasks SET note = CASE WHEN note='' THEN ? ELSE note || char(10) || ? END,"
                 " updated_at=? WHERE id=?",
                 (m_["text"], m_["text"], now, tid))
+        elif op == "complete":
+            # project.set_state owns completion -- it logs, moves the card and
+            # sets completed_at. A second copy here would be the one that
+            # drifts. It also means a completed task is no longer in `picked`,
+            # so it does not get dragged back onto today below.
+            import project
+            project.set_state(conn, tid, "done")
+            picked.discard(tid)
         applied += 1
         if op != "add":
             slug = _project_of(conn, tid)
