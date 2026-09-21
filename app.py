@@ -893,6 +893,49 @@ async def projects(authorization: str | None = Header(default=None),
 # claims it, and the result comes back here to be VALIDATED before anything
 # is written. plan.validate() is the gate; the worker never touches the board.
 
+@app.get("/plan/today.json")
+async def plan_today_json(authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Everything the Today tab needs, including WHICH DAY the plan is for.
+
+    The tab used to decide "is a plan in motion?" by asking whether the today
+    lane was non-empty. Unfinished items stay in that lane by design, so the
+    morning after a plan it still looked like the plan was current and the
+    planning screen never came back. A day is a date, not a row count.
+    """
+    _require_auth(authorization, session)
+    import datetime as _dt
+    import store
+    conn = store.connect()
+    try:
+        row = conn.execute(
+            "SELECT applied_at FROM plan_jobs WHERE applied_at IS NOT NULL"
+            " ORDER BY applied_at DESC LIMIT 1").fetchone()
+        planned_on = row["applied_at"][:10] if row else None
+        today_str = _dt.date.today().isoformat()
+
+        def slim(r):
+            return {"id": r["id"], "title": r["title"], "lane": r["lane"],
+                    "blocked_on": r["blocked_on"], "project": r["project"],
+                    "carried_from": (r["updated_at"][:10]
+                                     if r["lane"] == "today" and planned_on != today_str
+                                     else None)}
+
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE archived=0 AND status!='completed'"
+            " AND lane IN ('today','in_progress','backlog') ORDER BY seq, score DESC"
+        ).fetchall()
+        return {
+            "date": today_str,
+            "planned_on": planned_on,
+            "is_current": planned_on == today_str,
+            "today": [slim(r) for r in rows if r["lane"] == "today"],
+            "pool": [slim(r) for r in rows if r["lane"] != "today"],
+        }
+    finally:
+        conn.close()
+
+
 @app.post("/plan/draft")
 async def plan_draft(payload: dict | None = None,
         authorization: str | None = Header(default=None),

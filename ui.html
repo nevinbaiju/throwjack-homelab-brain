@@ -628,47 +628,54 @@ function todayShell(inner){ $('today').innerHTML = inner; }
 
 async function renderToday(){
   if (JOB && JOB.proposal){ (JOB.kind === 'update' ? renderUpdate : renderDraft)(); return; }
-  let lanes = {};
+  let d = null;
   try {
-    const r = await fetch('/board.json', {headers:H});
-    if (r.ok) lanes = (await r.json()).lanes || {};
+    const r = await fetch('/plan/today.json', {headers:H});
+    if (r.ok) d = await r.json();
   } catch (e) { /* offline */ }
-  const cur = lanes.today || [];
+  if (!d){ todayShell('<p class="empty">could not load</p>'); return; }
 
-  if (cur.length){
-    // The day is already fixed. From here you report what happened and only
-    // that changes; you do not re-plan unless you ask for it.
+  // A day is a DATE, not a row count. Unfinished items stay in the today
+  // lane on purpose, so "the lane is non-empty" kept the previous day's plan
+  // on screen every morning and the planning page never came back.
+  if (d.is_current){
     todayShell('<h2>Today</h2>' +
-      cur.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
+      d.today.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
         (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
         '</div></div>').join('') +
       '<textarea id="say" placeholder="what happened?"></textarea>' +
       '<div class="row"><button id="upd">Update</button>' +
       '<button id="mkplan" class="linkish">Re-plan the whole day</button></div>');
     $('upd').onclick = sendUpdate;
-    $('mkplan').onclick = () => { CACHE.board = null; startDraft([], ''); };
+    $('mkplan').onclick = () => startDraft([], '');
     $('say').addEventListener('keydown', e => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') sendUpdate();
     });
     return;
   }
 
-  // Fresh day. Everything you might pick is already on screen, unchecked,
-  // with a box and one button -- no round trip needed before you can say
-  // what the day is.
-  const pool = [].concat(lanes.in_progress || [], lanes.backlog || []);
+  // New day. Yesterday's unfinished work leads the list -- it is the most
+  // likely thing to still matter, and burying it under the backlog is how it
+  // gets silently dropped.
   let out = '<h2>Plan today</h2>';
-  if (!pool.length) out += '<p class="empty">Nothing in progress or backlog.</p>';
-  let lastLane = null;
-  for (const t of pool){
-    if (t.lane !== lastLane){
-      lastLane = t.lane;
-      out += '<div class="notpicked"><b>' + esc(LANE_LABEL[t.lane] || t.lane) + '</b></div>';
+  if (d.planned_on)
+    out += '<div class="notpicked">Last planned ' + esc(d.planned_on) + '.</div>';
+  const rows = [];
+  if (d.today.length) rows.push(['Carried over', d.today, true]);
+  const doing = d.pool.filter(t => t.lane === 'in_progress');
+  const back  = d.pool.filter(t => t.lane === 'backlog');
+  if (doing.length) rows.push(['In progress', doing, false]);
+  if (back.length)  rows.push(['Backlog', back, false]);
+  if (!rows.length) out += '<p class="empty">Nothing in progress or backlog.</p>';
+  for (const [label, items] of rows){
+    out += '<div class="notpicked"><b>' + esc(label) + '</b></div>';
+    for (const t of items){
+      out += '<label class="pick"><input type="checkbox" value="' + esc(t.id) + '">' +
+             '<div><div class="t">' + esc(t.title) + '</div>' +
+             (t.carried_from ? '<div class="why">carried from ' + esc(t.carried_from) + '</div>' : '') +
+             (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
+             '</div></label>';
     }
-    out += '<label class="pick"><input type="checkbox" value="' + esc(t.id) + '">' +
-           '<div><div class="t">' + esc(t.title) + '</div>' +
-           (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
-           '</div></label>';
   }
   out += '<textarea id="say" placeholder="anything else for today, or leave empty and let it choose"></textarea>' +
          '<div class="row"><button id="mkplan">Plan my day</button></div>';
