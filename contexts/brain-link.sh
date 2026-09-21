@@ -88,6 +88,14 @@ task ids, if you need them.
 
 Do not re-plan work \`STATE.md\` already lists as in progress or done.
 
+**First, check nothing is stuck.** Ingested captures are MOVED to
+\`.brain/captures/.ingested/\`. So any \`.md\` file sitting directly in
+\`.brain/captures/\` that you did not just write has not reached his board.
+If you find some, say so before anything else — name the files and stop. It
+usually means \`.brain\` points at a folder his server is not reading, and
+everything written through it is being silently discarded. Do not try to fix
+it yourself.
+
 **When something becomes actionable,** write a NEW markdown file into
 \`.brain/captures/\`, one item per file, e.g.
 \`.brain/captures/$(date +%Y-%m-%d)-short-slug.md\`. One or two sentences is
