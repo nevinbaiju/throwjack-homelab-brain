@@ -19,7 +19,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +34,17 @@ TIMEOUT = int(os.environ.get("BRAIN_CLAUDE_TIMEOUT", "180"))
 # No tools. This is a text-to-JSON transform and nothing else; the model has
 # no business touching the filesystem or the network from here, and denying it
 # also strips a few thousand tokens of tool preamble from every call.
+#
+# --mcp-config takes a JSON STRING, not only a path. This used to write
+# {"mcpServers":{}} into a tempfile once at startup and pass the path. /tmp is
+# a place things get deleted from -- that is its contract -- and on 2026-09-24
+# the dead CMOS battery made the box boot with a ten-day-stale clock, so the
+# file was created looking ten days old and systemd-tmpfiles-clean removed it
+# three minutes after boot. The long-lived worker never rewrote it, so every
+# plan failed with "MCP config file not found" until it was restarted. Passing
+# the literal string removes the file, and the failure mode with it.
+NO_MCP = '{"mcpServers":{}}'
+
 NO_TOOLS = ["Bash", "Read", "Write", "Edit", "WebFetch", "WebSearch",
             "Glob", "Grep", "Task", "TodoWrite", "NotebookEdit"]
 
@@ -52,12 +62,12 @@ def api(path: str, payload: dict | None = None, method: str | None = None):
     return json.loads(body) if body.strip() else {}
 
 
-def run_claude(system: str, user: str, mcp_path: str) -> str:
+def run_claude(system: str, user: str) -> str:
     p = subprocess.run(
         [CLAUDE, "-p", user,
          "--append-system-prompt", system,
          "--disallowed-tools", *NO_TOOLS,
-         "--strict-mcp-config", "--mcp-config", mcp_path,
+         "--strict-mcp-config", "--mcp-config", NO_MCP,
          "--output-format", "json"],
         capture_output=True, text=True, timeout=TIMEOUT)
     if p.returncode != 0:
@@ -73,11 +83,6 @@ def main() -> None:
         sys.exit("BRAIN_TOKEN is required — refusing to start without auth")
     if not os.path.exists(CLAUDE):
         sys.exit(f"claude not found at {CLAUDE}; set CLAUDE_BIN")
-
-    tmp = tempfile.mkdtemp(prefix="brain-planner-")
-    mcp = os.path.join(tmp, "mcp.json")
-    with open(mcp, "w") as f:
-        f.write('{"mcpServers":{}}')
 
     print(f"brain-planner: polling {BRAIN} every {IDLE}s", flush=True)
     warned = False
@@ -103,7 +108,7 @@ def main() -> None:
         t0 = time.time()
         try:
             ctx = job.get("context") or {}
-            raw = run_claude(ctx.get("system", ""), ctx.get("user", ""), mcp)
+            raw = run_claude(ctx.get("system", ""), ctx.get("user", ""))
             api(f"/plan/job/{jid}/result", {"raw": raw})
             print(f"  done in {time.time()-t0:.1f}s", flush=True)
         except Exception as e:                       # noqa: BLE001
