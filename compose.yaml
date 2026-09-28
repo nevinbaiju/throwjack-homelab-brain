@@ -30,7 +30,7 @@ services:
       - 75.75.76.76
       - 1.1.1.1
     ports:
-      - "5010:5010"
+      - "127.0.0.1:5010:5010"
     depends_on:
       - litellm
       - radicale
@@ -83,10 +83,9 @@ services:
   # already listens on eno1 AND tailscale0, so devices reach each other over
   # whichever path is up.
   #
-  # STGUIADDRESS controls the WEB UI only. 0.0.0.0 so it answers on the LAN
-  # (10.0.0.129:8384) and the tailnet (100.72.216.38:8384) alike. Nothing
-  # forwards 8384 at the router, so this is not internet-exposed — but the LAN
-  # is now in scope, so set a GUI password on first run.
+  # STGUIADDRESS controls the WEB UI only. Loopback, so the only ways in are
+  # Caddy (syncthing.throwjack) and tailscale serve (:8446), both HTTPS. On
+  # 0.0.0.0 it also answered as plain HTTP on 10.0.0.129:8384, bypassing both.
   syncthing:
     image: docker.io/syncthing/syncthing:2.1.5
     container_name: syncthing
@@ -103,7 +102,7 @@ services:
     environment:
       - PUID=0
       - PGID=0
-      - STGUIADDRESS=0.0.0.0:8384
+      - STGUIADDRESS=127.0.0.1:8384
     volumes:
       - ${SYNCTHING_CONFIG:-$HOME/.local/share/syncthing}:/var/syncthing/config:z
       - ${BRAIN_DATA:-/var/mnt/storage/brain}/contexts:/sync/contexts:z

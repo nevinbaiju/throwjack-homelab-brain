@@ -442,6 +442,21 @@ def fail_job(conn, job_id: str, error: str) -> None:
         (error[:2000], store.now_iso(), job_id))
 
 
+def pending_job(conn):
+    """The newest finished plan you have neither accepted nor discarded.
+
+    A draft used to live only in a JavaScript variable, so a reload -- or the
+    network dropping mid-review, which is how a real plan was lost on
+    2026-09-28 -- threw it away even though the job itself was safe in the
+    database. Surfacing it from here means the page can be closed and come
+    back to.
+    """
+    return conn.execute(
+        "SELECT * FROM plan_jobs WHERE state='done' AND proposal IS NOT NULL"
+        " AND applied_at IS NULL AND dismissed_at IS NULL"
+        " ORDER BY created_at DESC LIMIT 1").fetchone()
+
+
 def get_job(conn, job_id: str):
     return conn.execute("SELECT * FROM plan_jobs WHERE id=?", (job_id,)).fetchone()
 

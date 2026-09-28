@@ -148,6 +148,10 @@ MIGRATIONS = [
     # exactly instead of dumping everything into Backlog. Set when entering the
     # today lane, consumed and cleared when leaving it.
     ("tasks", "prev_lane", "TEXT"),
+    # A plan you looked at and rejected. Distinct from applied_at: the draft
+    # was never written to the board, so recording it as applied would be a
+    # lie, and leaving it null makes it resurface forever.
+    ("plan_jobs", "dismissed_at", "TEXT"),
 ]
 
 

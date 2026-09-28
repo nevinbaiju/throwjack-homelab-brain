@@ -622,6 +622,7 @@ loadRecent(); loadProjects();
 // to scroll past. You ask, it thinks for a few seconds, you argue with it,
 // and only then does anything move.
 let JOB = null;        // the draft under discussion
+let STALE = null;      // what a re-check dropped at apply time
 let POLL = null;
 
 function todayShell(inner){ $('today').innerHTML = inner; }
@@ -635,11 +636,24 @@ async function renderToday(){
   } catch (e) { /* offline */ }
   if (!d){ todayShell('<p class="empty">could not load</p>'); return; }
 
+  // A plan you asked for but never accepted is waiting on the server. It
+  // used to live only in this page's memory, so a reload or a dropped
+  // connection lost it while the finished job sat safe in the database.
+  if (d.pending){
+    JOB = d.pending;
+    (JOB.kind === 'update' ? renderUpdate : renderDraft)();
+    return;
+  }
+
+  let warn = '';
+  if (STALE){ warn = '<div class="warn">dropped as out of date: ' +
+    esc(STALE.join('; ')) + '</div>'; STALE = null; }
+
   // A day is a DATE, not a row count. Unfinished items stay in the today
   // lane on purpose, so "the lane is non-empty" kept the previous day's plan
   // on screen every morning and the planning page never came back.
   if (d.is_current){
-    todayShell('<h2>Today</h2>' +
+    todayShell(warn + '<h2>Today</h2>' +
       d.today.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
         (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
         '</div></div>').join('') +
@@ -760,6 +774,14 @@ function renderDraft(){
   // only under "also changes" made the list look short and wrong.
   const newToday = (p.mutations || []).filter(m => m.op === 'add' && m.lane === 'today');
   let out = '<h2>Today</h2>';
+  if (JOB.created_at){
+    out += '<div class="notpicked">Drafted ' +
+      esc(JOB.created_at.slice(0,16).replace('T',' ')) +
+      (JOB.from_today === false ? ' — <b>not today</b>' : '') +
+      '. Not yet accepted.' +
+      (JOB.message ? '<br>You asked: ' + esc(JOB.message.slice(0,220)) : '') +
+      '</div>';
+  }
   if (!p.today.length && !newToday.length)
     out += '<p class="empty">It picked nothing. Tell it why that is wrong.</p>';
   for (const m of newToday){
@@ -786,12 +808,14 @@ function renderDraft(){
   out += '<textarea id="say" placeholder="anything else it should know"></textarea>' +
          '<div class="row"><button id="accept">Accept</button>' +
          '<button id="again" class="linkish">Send</button>' +
-         '<button id="nomut" class="linkish">Accept, skip changes</button></div>';
+         '<button id="nomut" class="linkish">Accept, skip changes</button>' +
+         '<button id="binit" class="linkish">Discard</button></div>';
   todayShell(out);
 
   $('accept').onclick = () => applyDraft(false);
   $('nomut').onclick  = () => applyDraft(true);
   $('again').onclick  = sendRevision;
+  if ($('binit')) $('binit').onclick = dismissDraft;
   $('say').addEventListener('keydown', e => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') sendRevision();
   });
@@ -813,6 +837,19 @@ async function sendRevision(){
   }
 }
 
+async function dismissDraft(){
+  if (!JOB) { renderToday(); return; }
+  todayShell('<p class="spin">Discarding…</p>');
+  try {
+    const r = await fetch('/plan/job/' + encodeURIComponent(JOB.id) + '/dismiss',
+                          {method:'POST', headers:H});
+    if (!r.ok) throw new Error(await r.text());
+    JOB = null; renderToday();
+  } catch (e) {
+    todayShell('<p class="empty">could not discard — ' + esc(e.message) + '</p>');
+  }
+}
+
 async function applyDraft(skipMutations){
   const accept = Array.from(document.querySelectorAll('#today input[type=checkbox]'))
                       .filter(c => c.checked).map(c => c.value);
@@ -823,8 +860,12 @@ async function applyDraft(skipMutations){
       body: JSON.stringify({job: JOB.id, accept: accept,
                             skip_mutations: !!skipMutations})});
     if (!r.ok) throw new Error(await r.text());
+    const res = await r.json();
     JOB = null;
     CACHE.board = null;          // the board changed under it
+    // Whatever the re-check dropped -- usually a task finished since the plan
+    // was drafted -- gets said out loud rather than silently omitted.
+    if (res.stale && res.stale.length) STALE = res.stale;
     renderToday();
   } catch (e) {
     todayShell('<p class="empty">could not apply — ' + esc(e.message) + '</p>');

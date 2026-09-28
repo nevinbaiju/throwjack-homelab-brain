@@ -925,10 +925,27 @@ async def plan_today_json(authorization: str | None = Header(default=None),
             "SELECT * FROM tasks WHERE archived=0 AND status!='completed'"
             " AND lane IN ('today','in_progress','backlog') ORDER BY seq, score DESC"
         ).fetchall()
+        # A finished plan you have neither accepted nor discarded. It used to
+        # exist only in the page's memory, so a reload or a dropped connection
+        # threw it away while the job sat safe in the database.
+        import plan as _plan
+        pend = _plan.pending_job(conn)
+        pending = None
+        if pend is not None:
+            pending = {
+                "id": pend["id"], "kind": pend["kind"],
+                "created_at": pend["created_at"],
+                "from_today": pend["created_at"][:10] == today_str,
+                "message": pend["message"] or "",
+                "proposal": json.loads(pend["proposal"]),
+                "rejected": json.loads(pend["rejected"] or "[]"),
+            }
+
         return {
             "date": today_str,
             "planned_on": planned_on,
             "is_current": planned_on == today_str,
+            "pending": pending,
             "today": [slim(r) for r in rows if r["lane"] == "today"],
             "pool": [slim(r) for r in rows if r["lane"] != "today"],
         }
@@ -1099,6 +1116,25 @@ async def plan_result(job_id: str, payload: dict,
         conn.close()
 
 
+@app.post("/plan/job/{job_id}/dismiss")
+async def plan_dismiss(job_id: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Throw a plan away without applying it, so it stops resurfacing."""
+    _require_auth(authorization, session)
+    import store, plan
+    conn = store.connect()
+    try:
+        if plan.get_job(conn, job_id) is None:
+            raise HTTPException(status_code=404, detail="no such job")
+        conn.execute("UPDATE plan_jobs SET dismissed_at=?, updated_at=? WHERE id=?",
+                     (store.now_iso(), store.now_iso(), job_id))
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
 @app.post("/plan/apply")
 async def plan_apply(payload: dict, background: BackgroundTasks,
         authorization: str | None = Header(default=None),
@@ -1116,7 +1152,19 @@ async def plan_apply(payload: dict, background: BackgroundTasks,
             raise HTTPException(status_code=409, detail="job is not ready")
         if row["applied_at"]:
             raise HTTPException(status_code=409, detail="already applied")
-        proposal = json.loads(row["proposal"])
+        if row["dismissed_at"]:
+            raise HTTPException(status_code=409, detail="already discarded")
+
+        # Re-validate against the board as it is NOW, not as it was when the
+        # plan was written. A draft can sit for minutes or days, and in between
+        # you may have ticked something off on your phone -- active_tasks
+        # excludes completed and archived rows, so a stale entry is dropped
+        # here rather than resurrecting a finished task onto today. Cheap
+        # insurance, and the raw reply is stored precisely so this is possible.
+        if row["kind"] == "update":
+            proposal, stale = plan.validate_update(conn, row["raw"] or "")
+        else:
+            proposal, stale = plan.validate(conn, row["raw"] or "")
         keep = payload.get("accept")
         if row["kind"] == "update":
             # For an update, `accept` is the indices of the changes you kept.
@@ -1144,4 +1192,4 @@ async def plan_apply(payload: dict, background: BackgroundTasks,
     # decided what today is, and the list should exist before you put the
     # phone down.
     background.add_task(run_triage_once)
-    return {"ok": True, **result}
+    return {"ok": True, "stale": stale, **result}
