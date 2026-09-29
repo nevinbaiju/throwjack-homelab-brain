@@ -929,22 +929,55 @@ async def plan_today_json(authorization: str | None = Header(default=None),
         # exist only in the page's memory, so a reload or a dropped connection
         # threw it away while the job sat safe in the database.
         import plan as _plan
+
+        # A plan you never accepted is stale the next morning: it was written
+        # against a board that has moved on, and its prose describes tasks that
+        # may now be done. Retire it here rather than letting it hijack the page
+        # forever -- which is exactly what happened, for five days, with a draft
+        # that was not even his. The typed prompt stays in plan_jobs.message.
+        if _plan.retire_stale_pending(conn, today_str):
+            conn.commit()
+
+        # A request still in flight. Reported separately from `pending` so the
+        # page can wait for it rather than offering to start another.
+        wjob = _plan.working_job(conn, today_str)
+        working = None if wjob is None else {
+            "id": wjob["id"], "kind": wjob["kind"], "created_at": wjob["created_at"]}
+
         pend = _plan.pending_job(conn)
+
         pending = None
         if pend is not None:
+            # Re-validate against the board NOW rather than showing the
+            # snapshot taken when the plan was written. A draft left overnight
+            # listed tasks that had since been completed -- and worse, listed
+            # them as things it was about to change. What is displayed has to
+            # be what apply would actually do, and apply already re-validates.
+            if pend["kind"] == "update":
+                prop, stale = _plan.validate_update(conn, pend["raw"] or "")
+            else:
+                prop, stale = _plan.validate(conn, pend["raw"] or "")
+            # Notes are the model's prose ABOUT the proposal. If part of the
+            # proposal failed re-validation the prose describes something that
+            # is no longer true, and prose cannot be re-validated -- so it is
+            # withheld rather than shown alongside a contradiction.
+            if stale:
+                prop = dict(prop, notes="")
             pending = {
                 "id": pend["id"], "kind": pend["kind"],
                 "created_at": pend["created_at"],
-                "from_today": pend["created_at"][:10] == today_str,
+                "from_today": True,          # guaranteed by the retirement loop
                 "message": pend["message"] or "",
-                "proposal": json.loads(pend["proposal"]),
-                "rejected": json.loads(pend["rejected"] or "[]"),
+                "proposal": prop,
+                "dropped": len(stale),       # a count for the page
+                "rejected": stale,           # detail, for debugging only
             }
 
         return {
             "date": today_str,
             "planned_on": planned_on,
             "is_current": planned_on == today_str,
+            "working": working,
             "pending": pending,
             "today": [slim(r) for r in rows if r["lane"] == "today"],
             "pool": [slim(r) for r in rows if r["lane"] != "today"],
@@ -1165,23 +1198,22 @@ async def plan_apply(payload: dict, background: BackgroundTasks,
             proposal, stale = plan.validate_update(conn, row["raw"] or "")
         else:
             proposal, stale = plan.validate(conn, row["raw"] or "")
+        # `accept` is a set of stable ids: a task id for a today pick, a
+        # content key for a mutation. It used to be positions for mutations,
+        # which broke the moment apply started re-validating -- dropping an
+        # entry shifted every position after it, so unticking one change could
+        # discard a different one. Anything not listed is simply not applied.
         keep = payload.get("accept")
+        if isinstance(keep, list):
+            kept = {str(k) for k in keep}
+            proposal["mutations"] = [m for m in proposal.get("mutations", [])
+                                     if m.get("key") in kept]
+            if "today" in proposal:
+                proposal["today"] = [i for i in proposal["today"]
+                                     if i["task_id"] in kept]
         if row["kind"] == "update":
-            # For an update, `accept` is the indices of the changes you kept.
-            # Unticking one drops just that change; the rest still apply.
-            if isinstance(keep, list):
-                idx = {int(i) for i in keep if str(i).lstrip("-").isdigit()}
-                proposal["mutations"] = [m for n, m in enumerate(proposal["mutations"])
-                                         if n in idx]
             result = plan.apply_update(conn, proposal)
         else:
-            # For a draft, `accept` is the task ids you left ticked. You are
-            # the authority on your own day.
-            if isinstance(keep, list):
-                kept = set(keep)
-                proposal["today"] = [i for i in proposal["today"] if i["task_id"] in kept]
-            if payload.get("skip_mutations"):
-                proposal["mutations"] = []
             result = plan.apply(conn, proposal)
         conn.execute("UPDATE plan_jobs SET applied_at=?, updated_at=? WHERE id=?",
                      (store.now_iso(), store.now_iso(), job_id))

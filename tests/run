@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# Host-side tests. Scratch databases only; nothing here can reach the board.
+set -u
+cd "$(dirname "$0")/.."
+rc=0
+
+for t in tests/test_validation.py tests/test_keys_and_retirement.py; do
+  echo "== $t"
+  python3 "$t" || rc=1
+done
+
+echo "== tests/test_screen.js (screen decision, no DOM)"
+# Extract into the tests dir, not /tmp: SELinux refuses to relabel /tmp for a
+# container mount, so mounting it fails outright.
+python3 - <<'PY'
+import re, pathlib
+s = pathlib.Path("ui.html").read_text()
+pathlib.Path("tests/.ui.extracted.js").write_text(
+    re.search(r"<script>(.*)</script>", s, re.S).group(1))
+PY
+IMG=$(podman inspect homepage --format '{{.ImageName}}' 2>/dev/null)
+if [ -n "$IMG" ]; then
+  out=$(podman run --rm -v "$PWD/tests:/t:ro,z" "$IMG" \
+          node /t/test_screen.js /t/.ui.extracted.js 2>&1 | grep -vE 'Skipping|chown')
+  status=$?
+  echo "$out"
+  echo "$out" | grep -q FAIL && status=1
+  [ "$status" -eq 0 ] || rc=1
+else
+  echo "  (no node image available; skipped)"
+fi
+rm -f tests/.ui.extracted.js
+
+echo
+echo "== endpoint + apply tests run inside the container:  tests/run-in-brain"
+[ "$rc" -eq 0 ] && echo "ALL HOST TESTS PASSED" || echo "HOST TESTS FAILED"
+exit $rc

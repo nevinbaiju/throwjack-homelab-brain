@@ -11,3 +11,4 @@ __pycache__/
 *.db
 *.db-*
 radicale/users
+tests/.ui.extracted.js

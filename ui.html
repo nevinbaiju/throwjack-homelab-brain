@@ -516,7 +516,8 @@ function renderBoard(data){
   const out = [];
   for (const lane of data.order){
     const items = data.lanes[lane] || [];
-    if (!items.length && lane !== 'in_progress') continue;   // in progress is worth showing empty
+    // Every lane, always. An empty Backlog is a fact worth seeing; hiding it
+    // made the board look like the lane did not exist at all.
     out.push('<section class="lane"><h2>' + esc(LANE_LABEL[lane] || lane) +
              '<span class="n">' + items.length + '</span></h2><ul>');
     if (!items.length) out.push('<li class="empty">nothing here</li>');
@@ -627,32 +628,68 @@ let POLL = null;
 
 function todayShell(inner){ $('today').innerHTML = inner; }
 
-async function renderToday(){
-  if (JOB && JOB.proposal){ (JOB.kind === 'update' ? renderUpdate : renderDraft)(); return; }
+// Which screen the Today tab shows. Pure, and deliberately separate from
+// rendering so the decision can be tested without a DOM -- the ordering here
+// has been wrong twice and cost real plans.
+//
+//   review  : a plan drafted TODAY that you have neither accepted nor binned
+//   current : a plan was applied today; report what happened
+//   fresh   : plan the day from the board
+//
+// A pending draft must NOT outrank the date check for drafts from other days.
+// The server retires those, and this ignores them anyway -- belt and braces,
+// because a five-day-old draft hijacking every morning is what happens when
+// only one of the two is true.
+function chooseScreen(d){
+  if (!d) return 'error';
+  // A request in flight outranks everything: it is the thing you are waiting
+  // for, and offering "Plan my day" again would queue a second one.
+  if (d.working) return 'working';
+  if (d.pending && d.pending.from_today) return 'review';
+  if (d.is_current) return 'current';
+  return 'fresh';
+}
+
+// Never put validator strings on screen. They are internal ids written for a
+// developer, and for a stale plan they are a wall of hex.
+function staleLine(n){
+  const c = Array.isArray(n) ? n.length : Number(n || 0);
+  if (!c) return '';
+  return c + (c === 1 ? ' item was' : ' items were') +
+         ' dropped — finished or removed since the plan was made.';
+}
+
+async function renderToday(warnIn){
+  if (JOB && JOB.proposal){ (JOB.kind === 'update' ? renderUpdate : renderDraft)(warnIn || ''); return; }
   let d = null;
   try {
     const r = await fetch('/plan/today.json', {headers:H});
     if (r.ok) d = await r.json();
   } catch (e) { /* offline */ }
-  if (!d){ todayShell('<p class="empty">could not load</p>'); return; }
 
-  // A plan you asked for but never accepted is waiting on the server. It
-  // used to live only in this page's memory, so a reload or a dropped
-  // connection lost it while the finished job sat safe in the database.
-  if (d.pending){
-    JOB = d.pending;
-    (JOB.kind === 'update' ? renderUpdate : renderDraft)();
+  // Built BEFORE any branch. It used to be computed after the pending return,
+  // so a message about what apply had dropped was lost on one of three screens.
+  let warn = warnIn || '';
+  if (STALE){ warn += '<div class="warn">' + staleLine(STALE) + '</div>'; STALE = null; }
+
+  const screen = chooseScreen(d);
+  if (screen === 'error'){ todayShell(warn + '<p class="empty">could not load</p>'); return; }
+
+  if (screen === 'working'){
+    // Rejoin the job instead of starting another. waitFor renders the draft
+    // when it lands, so a reload mid-generation costs nothing.
+    todayShell(warn + '<p class="spin">Still thinking about today\u2026</p>');
+    waitFor(d.working.id, j => { JOB = j; (j.kind === 'update' ? renderUpdate : renderDraft)(); });
     return;
   }
 
-  let warn = '';
-  if (STALE){ warn = '<div class="warn">dropped as out of date: ' +
-    esc(STALE.join('; ')) + '</div>'; STALE = null; }
+  if (screen === 'review'){
+    JOB = d.pending;
+    (JOB.kind === 'update' ? renderUpdate : renderDraft)(warn);
+    return;
+  }
 
-  // A day is a DATE, not a row count. Unfinished items stay in the today
-  // lane on purpose, so "the lane is non-empty" kept the previous day's plan
-  // on screen every morning and the planning page never came back.
-  if (d.is_current){
+  if (screen === 'current'){
     todayShell(warn + '<h2>Today</h2>' +
       d.today.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
         (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
@@ -668,18 +705,18 @@ async function renderToday(){
     return;
   }
 
-  // New day. Yesterday's unfinished work leads the list -- it is the most
+  // Fresh day. Yesterday's unfinished work leads the list -- it is the most
   // likely thing to still matter, and burying it under the backlog is how it
   // gets silently dropped.
-  let out = '<h2>Plan today</h2>';
+  let out = warn + '<h2>Plan today</h2>';
   if (d.planned_on)
     out += '<div class="notpicked">Last planned ' + esc(d.planned_on) + '.</div>';
   const rows = [];
-  if (d.today.length) rows.push(['Carried over', d.today, true]);
+  if (d.today.length) rows.push(['Carried over', d.today]);
   const doing = d.pool.filter(t => t.lane === 'in_progress');
   const back  = d.pool.filter(t => t.lane === 'backlog');
-  if (doing.length) rows.push(['In progress', doing, false]);
-  if (back.length)  rows.push(['Backlog', back, false]);
+  if (doing.length) rows.push(['In progress', doing]);
+  if (back.length)  rows.push(['Backlog', back]);
   if (!rows.length) out += '<p class="empty">Nothing in progress or backlog.</p>';
   for (const [label, items] of rows){
     out += '<div class="notpicked"><b>' + esc(label) + '</b></div>';
@@ -751,13 +788,16 @@ function mutLine(m){
   if (m.op === 'retitle')
     return '<div class="mut">↻ <b>retitle</b> — “' + esc(m.was || '') + '” → “' + esc(m.title) + '”</div>';
   if (m.op === 'set_blocked')
-    return '<div class="mut">⛔ <b>blocked on</b> ' + esc(m.blocked_on) + '</div>';
+    return '<div class="mut">⛔ <b>blocked on</b> ' + esc(m.blocked_on) +
+           ' — ' + esc(m.title || m.task_id) + '</div>';
   if (m.op === 'clear_blocked')
     return '<div class="mut">✓ <b>unblocked</b></div>';
   if (m.op === 'set_lane')
-    return '<div class="mut">→ <b>move to</b> ' + esc(m.lane) + '</div>';
+    return '<div class="mut">→ <b>move to</b> ' + esc(m.lane) +
+           ' — ' + esc(m.title || m.task_id) + '</div>';
   if (m.op === 'note_append')
-    return '<div class="mut">＋ <b>note</b> ' + esc(m.text) + '</div>';
+    return '<div class="mut">＋ <b>note</b> ' + esc(m.text) +
+           ' — ' + esc(m.title || m.task_id) + '</div>';
   if (m.op === 'list_add')
     return '<div class="mut">🛒 <b>' + esc(m.label) + '</b> — ' + esc((m.items||[]).join(', ')) + '</div>';
   if (m.op === 'complete')
@@ -765,28 +805,34 @@ function mutLine(m){
   return '';
 }
 
-function renderDraft(){
+function renderDraft(warn){
   const p = JOB.proposal || {today:[], mutations:[], notes:''};
+  const muts = p.mutations || [];
   const byTask = {};
-  for (const m of (p.mutations || [])) (byTask[m.task_id] = byTask[m.task_id] || []).push(m);
+  for (const m of muts) (byTask[m.task_id] = byTask[m.task_id] || []).push(m);
 
-  // Tasks it is CREATING for today are part of the day too -- showing them
-  // only under "also changes" made the list look short and wrong.
-  const newToday = (p.mutations || []).filter(m => m.op === 'add' && m.lane === 'today');
-  let out = '<h2>Today</h2>';
+  // Tasks it is CREATING for today are part of the day, not a footnote.
+  const newToday = muts.filter(m => m.op === 'add' && m.lane === 'today');
+
+  let out = (warn || '') + '<h2>Today</h2>';
   if (JOB.created_at){
     out += '<div class="notpicked">Drafted ' +
-      esc(JOB.created_at.slice(0,16).replace('T',' ')) +
-      (JOB.from_today === false ? ' — <b>not today</b>' : '') +
-      '. Not yet accepted.' +
+      esc(JOB.created_at.slice(0,16).replace('T',' ')) + '. Not yet accepted.' +
       (JOB.message ? '<br>You asked: ' + esc(JOB.message.slice(0,220)) : '') +
       '</div>';
   }
   if (!p.today.length && !newToday.length)
     out += '<p class="empty">It picked nothing. Tell it why that is wrong.</p>';
+
+  // EVERYTHING is individually tickable, and every checkbox carries a stable
+  // id -- a task id for a pick, a content key for a change. There used to be
+  // an "Accept, skip changes" button that dropped ALL mutations, including the
+  // new tasks rendered right here as part of the day: accepting the day would
+  // silently bin the things you had just asked for.
   for (const m of newToday){
-    out += '<div class="pick"><div><div class="t">' + esc(m.title) + '</div>' +
-           '<div class="why">new task</div></div></div>';
+    out += '<label class="pick"><input type="checkbox" checked value="' + esc(m.key) + '">' +
+           '<div><div class="t">' + esc(m.title) + '</div>' +
+           '<div class="why">new task</div></div></label>';
   }
   for (const i of p.today){
     out += '<label class="pick"><input type="checkbox" checked value="' + esc(i.task_id) + '">' +
@@ -795,27 +841,32 @@ function renderDraft(){
            (byTask[i.task_id] || []).map(mutLine).join('') +
            '</div></label>';
   }
-  // Mutations on tasks that are NOT in today still change the board, so they
-  // must be visible rather than buried.
-  const other = (p.mutations || []).filter(m =>
+
+  // Changes to tasks that are not on today's list still alter the board, so
+  // they get their own tickable rows rather than being buried in prose.
+  const other = muts.filter(m =>
     !(m.op === 'add' && m.lane === 'today') &&
     !p.today.some(i => i.task_id === m.task_id));
-  if (other.length) out += '<div class="notpicked"><b>Also changes:</b>' + other.map(mutLine).join('') + '</div>';
+  if (other.length){
+    out += '<div class="notpicked"><b>Also changes</b></div>';
+    for (const m of other){
+      out += '<label class="pick"><input type="checkbox" checked value="' + esc(m.key) + '">' +
+             '<div>' + mutLine(m) + '</div></label>';
+    }
+  }
+
   if (p.notes) out += '<div class="notpicked">' + esc(p.notes) + '</div>';
-  if ((JOB.rejected || []).length)
-    out += '<div class="warn">dropped: ' + esc(JOB.rejected.join('; ')) + '</div>';
+  if (JOB.dropped) out += '<div class="warn">' + staleLine(JOB.dropped) + '</div>';
 
   out += '<textarea id="say" placeholder="anything else it should know"></textarea>' +
          '<div class="row"><button id="accept">Accept</button>' +
          '<button id="again" class="linkish">Send</button>' +
-         '<button id="nomut" class="linkish">Accept, skip changes</button>' +
          '<button id="binit" class="linkish">Discard</button></div>';
   todayShell(out);
 
-  $('accept').onclick = () => applyDraft(false);
-  $('nomut').onclick  = () => applyDraft(true);
+  $('accept').onclick = applyDraft;
   $('again').onclick  = sendRevision;
-  if ($('binit')) $('binit').onclick = dismissDraft;
+  $('binit').onclick  = dismissDraft;
   $('say').addEventListener('keydown', e => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') sendRevision();
   });
@@ -850,21 +901,20 @@ async function dismissDraft(){
   }
 }
 
-async function applyDraft(skipMutations){
+async function applyDraft(){
+  // One accept list for both screens: a task id for a today pick, a content
+  // key for a change. Anything unticked is simply not applied.
   const accept = Array.from(document.querySelectorAll('#today input[type=checkbox]'))
                       .filter(c => c.checked).map(c => c.value);
   todayShell('<p class="spin">Applying…</p>');
   try {
     const r = await fetch('/plan/apply', {method:'POST',
       headers:Object.assign({'Content-Type':'application/json'}, H),
-      body: JSON.stringify({job: JOB.id, accept: accept,
-                            skip_mutations: !!skipMutations})});
+      body: JSON.stringify({job: JOB.id, accept: accept})});
     if (!r.ok) throw new Error(await r.text());
     const res = await r.json();
     JOB = null;
-    CACHE.board = null;          // the board changed under it
-    // Whatever the re-check dropped -- usually a task finished since the plan
-    // was drafted -- gets said out loud rather than silently omitted.
+    CACHE.board = null;
     if (res.stale && res.stale.length) STALE = res.stale;
     renderToday();
   } catch (e) {
@@ -902,44 +952,34 @@ function updLine(m){
   return esc(m.op);
 }
 
-function renderUpdate(){
+function renderUpdate(warn){
   const p = JOB.proposal || {mutations:[], notes:''};
-  if (!p.mutations.length){
-    todayShell('<p class="empty">Nothing to change.' +
+  const muts = p.mutations || [];
+  if (!muts.length){
+    // Discard, not "Back": clearing the in-memory job alone left the row
+    // pending on the server, so the next render fetched it and showed this
+    // same screen again, forever.
+    todayShell((warn || '') + '<p class="empty">Nothing to change.' +
       (p.notes ? ' ' + esc(p.notes) : '') + '</p>' +
-      ((JOB.rejected||[]).length ? '<div class="warn">' + esc(JOB.rejected.join('; ')) + '</div>' : '') +
-      '<div class="row"><button id="back">Back</button></div>');
-    $('back').onclick = () => { JOB = null; renderToday(); };
+      (JOB.dropped ? '<div class="warn">' + staleLine(JOB.dropped) + '</div>' : '') +
+      '<div class="row"><button id="binit">Discard</button></div>');
+    $('binit').onclick = dismissDraft;
     return;
   }
-  // Each change is individually tickable: one wrong reading of your message
-  // should not cost you the other five.
-  let out = '<h2>About to change</h2>';
-  p.mutations.forEach((m, i) => {
-    out += '<label class="pick"><input type="checkbox" checked value="' + i + '">' +
+  // Ticked by stable key, never by position: apply re-validates and can drop
+  // entries, which shifts every position after it.
+  let out = (warn || '') + '<h2>About to change</h2>';
+  for (const m of muts){
+    out += '<label class="pick"><input type="checkbox" checked value="' + esc(m.key) + '">' +
            '<div><div class="t">' + updLine(m) + '</div></div></label>';
-  });
+  }
   if (p.notes) out += '<div class="notpicked">' + esc(p.notes) + '</div>';
-  if ((JOB.rejected || []).length)
-    out += '<div class="warn">' + esc(JOB.rejected.join('; ')) + '</div>';
+  if (JOB.dropped) out += '<div class="warn">' + staleLine(JOB.dropped) + '</div>';
   out += '<div class="row"><button id="doupd">Apply</button>' +
-         '<button id="cancel" class="linkish">Discard</button></div>';
+         '<button id="binit" class="linkish">Discard</button></div>';
   todayShell(out);
-  $('cancel').onclick = () => { JOB = null; renderToday(); };
-  $('doupd').onclick = async () => {
-    const accept = Array.from(document.querySelectorAll('#today input[type=checkbox]'))
-                        .filter(c => c.checked).map(c => Number(c.value));
-    todayShell('<p class="spin">Applying…</p>');
-    try {
-      const r = await fetch('/plan/apply', {method:'POST',
-        headers:Object.assign({'Content-Type':'application/json'}, H),
-        body: JSON.stringify({job: JOB.id, accept: accept})});
-      if (!r.ok) throw new Error(await r.text());
-      JOB = null; CACHE.board = null; renderToday();
-    } catch (e) {
-      todayShell('<p class="empty">could not apply — ' + esc(e.message) + '</p>');
-    }
-  };
+  $('binit').onclick = dismissDraft;
+  $('doupd').onclick = applyDraft;
 }
 
 </script>

@@ -183,6 +183,24 @@ Otherwise, when they have not told you what the day is:
   rejected and shows as a warning."""
 
 
+def _key_mutations(muts: list[dict]) -> None:
+    """Give every mutation a content-derived id, in place.
+
+    The phone used to tick mutations by their POSITION in the list. Apply
+    re-validates against the live board, which can DROP entries, so position 3
+    before was not position 3 after -- unticking one change could discard a
+    different one. A key derived from content is stable under dropping,
+    because identical content validates identically.
+    """
+    seen: dict[str, int] = {}
+    for m in muts:
+        base = "{}:{}".format(m["op"],
+                              m.get("task_id") or m.get("title") or m.get("list") or "")
+        n = seen.get(base, 0)
+        seen[base] = n + 1
+        m["key"] = base if n == 0 else f"{base}#{n}"
+
+
 def validate(conn, raw: str) -> tuple[dict, list[str]]:
     """Model output -> (proposal, rejected reasons). Never raises on junk."""
     rejected: list[str] = []
@@ -240,6 +258,7 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
         else:
             muts.append(clean)
 
+    _key_mutations(muts)
     return ({"today": today, "mutations": muts,
              "notes": str(data.get("notes", ""))[:400]}, rejected)
 
@@ -457,6 +476,41 @@ def pending_job(conn):
         " ORDER BY created_at DESC LIMIT 1").fetchone()
 
 
+def working_job(conn, today: str):
+    """A plan requested today that the worker has not finished yet.
+
+    pending_job() only sees state='done', so a job still in flight was
+    invisible: reload the page mid-generation -- a phone locking its screen is
+    enough -- and it showed "Plan my day" as though nothing had been asked,
+    inviting a second request for the same day.
+    """
+    return conn.execute(
+        "SELECT * FROM plan_jobs WHERE state IN ('pending','running')"
+        " AND dismissed_at IS NULL AND substr(created_at,1,10)=?"
+        " ORDER BY created_at DESC LIMIT 1", (today,)).fetchone()
+
+
+def retire_stale_pending(conn, today: str) -> list[str]:
+    """Bin any un-accepted plan that was not drafted today. Returns their ids.
+
+    A plan you never accepted is stale the next morning: it was written against
+    a board that has moved on, and its prose describes tasks that may now be
+    done. Left alone it hijacks the page every day forever -- which is exactly
+    what a five-day-old draft did. The typed prompt survives in
+    plan_jobs.message, so nothing you wrote is lost.
+    """
+    binned: list[str] = []
+    for _ in range(50):                      # bounded; never spin on this
+        row = pending_job(conn)
+        if row is None or row["created_at"][:10] == today:
+            break
+        conn.execute(
+            "UPDATE plan_jobs SET dismissed_at=?, updated_at=? WHERE id=?",
+            (store.now_iso(), store.now_iso(), row["id"]))
+        binned.append(row["id"])
+    return binned
+
+
 def get_job(conn, job_id: str):
     return conn.execute("SELECT * FROM plan_jobs WHERE id=?", (job_id,)).fetchone()
 
@@ -591,12 +645,14 @@ def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
         lane = str(m.get("lane", ""))
         if lane not in ("backlog", "in_progress"):
             return None, f"refused set_lane to {lane!r}"
-        return {"op": op, "task_id": tid, "lane": lane}, None
+        return {"op": op, "task_id": tid, "lane": lane,
+                "title": row["title"]}, None
     if op == "set_blocked":
         who = str(m.get("blocked_on", "")).strip()[:120]
         if not who:
             return None, f"set_blocked on {tid} with no blocked_on"
-        return {"op": op, "task_id": tid, "blocked_on": who}, None
+        return {"op": op, "task_id": tid, "blocked_on": who,
+                "title": row["title"]}, None
     if op == "retitle":
         title = str(m.get("title", "")).strip()[:200]
         if not title:
@@ -606,7 +662,8 @@ def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
         txt = str(m.get("text", "")).strip()[:500]
         if not txt:
             return None, f"note_append on {tid} with no text"
-        return {"op": op, "task_id": tid, "text": txt}, None
+        return {"op": op, "task_id": tid, "text": txt,
+                "title": row["title"]}, None
     if op in ("clear_blocked", "complete", "to_today", "from_today"):
         return {"op": op, "task_id": tid, "title": row["title"]}, None
     return None, f"unhandled op {op!r}"
@@ -652,6 +709,7 @@ def validate_update(conn, raw: str) -> tuple[dict, list[str]]:
         if after > TODAY_CAP:
             rejected.append(f"today would hold {after} items, over the cap of {TODAY_CAP}")
 
+    _key_mutations(muts)
     return {"mutations": muts, "notes": str(data.get("notes", ""))[:400]}, rejected
 
 

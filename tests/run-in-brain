@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Endpoint tests. They assert BRAIN_ROOT is under /tmp and refuse otherwise.
+set -u
+cd "$(dirname "$0")/.."
+rc=0
+for t in test_today_endpoint.py test_apply.py; do
+  echo "== $t"
+  podman cp "tests/$t" "brain:/tmp/$t"
+  podman exec -e BRAIN_ROOT="/tmp/scratch-$t" brain sh -c \
+    "rm -rf /tmp/scratch-$t; mkdir -p /tmp/scratch-$t/state && python /tmp/$t" || rc=1
+done
+exit $rc
