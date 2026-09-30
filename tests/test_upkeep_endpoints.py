@@ -34,9 +34,18 @@ out = run(A.upkeep_create(Req({"title": "Laundry", "every": "7d",
                                "time_of_day": "evening", "est_min": 20}), TOK))
 check("a second chore can be created", out["slug"] == "laundry", str(out))
 
+# The words a person types, which used to 400 with an invisible error message.
+out = run(A.upkeep_create(Req({"title": "Clean the floor", "every": "monthly"}), TOK))
+check("'monthly' is accepted and stored canonically", out["slug"] == "clean-the-floor")
+upkeep._cache = None
+check("...as 1m", upkeep.by_slug("clean-the-floor")["every"] == "1m",
+      upkeep.by_slug("clean-the-floor")["every"])
+run(A.upkeep_delete("clean-the-floor", TOK))
+upkeep._cache = None
+
 for bad, why in (({"title": "", "every": "7d"},           "no title"),
                  ({"title": "X"},                          "no cadence"),
-                 ({"title": "X", "every": "weekly"},       "a v1 cadence"),
+                 ({"title": "X", "every": "sometimes"},    "an unreadable cadence"),
                  ({"title": "X", "every": "7d", "window": "fortnight"}, "a bad window"),
                  ({"title": "X", "every": "7d", "days": ["funday"]},    "a bad weekday")):
     try:

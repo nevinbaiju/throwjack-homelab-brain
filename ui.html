@@ -56,7 +56,11 @@
     text-transform:uppercase;padding:11px 22px;border:0;border-radius:8px;cursor:pointer;
     background:var(--accent);color:var(--accent-ink)}
   #send[disabled]{opacity:.5;cursor:default}
-  #status{font-family:var(--mono);font-size:12.5px;color:var(--ok);min-height:1.2em;
+  #status{position:fixed;left:50%;transform:translateX(-50%);bottom:18px;z-index:50;
+    max-width:min(92vw,520px);padding:9px 14px;border-radius:8px;text-align:center;
+    background:var(--raise);border:1px solid var(--rule);box-shadow:0 6px 24px #0007;
+    pointer-events:none;
+    font-family:var(--mono);font-size:12.5px;color:var(--ok);min-height:1.2em;
     opacity:0;transition:opacity .18s}
   #status.show{opacity:1}
   #status.err{color:var(--signal)}
@@ -149,6 +153,7 @@
   .cadedit label{font-family:var(--mono);font-size:11px;color:var(--ink-3);
     display:inline-flex;gap:3px;align-items:center}
   .daysel{display:inline-flex;gap:5px;flex-wrap:wrap}
+  .choreerr{flex-basis:100%;color:var(--signal)}
   /* A chore that is due should read as due without having to parse the line. */
   .task.st-due .cad:first-of-type{color:var(--ink)}
   .task.st-waiting .cad:first-of-type,.task.st-snoozed .cad:first-of-type{opacity:.7}
@@ -188,8 +193,12 @@
 
   <div class="bar">
     <button id="send">Send</button>
-    <span id="status" role="status" aria-live="polite"></span>
   </div>
+  <!-- OUTSIDE .bar. setMode() hides .bar on every tab except File and Plan, so
+       while #status lived in there every say() on Upkeep, Shop, Board and Today
+       was invisible -- a chore rejected with a perfectly good reason looked like
+       a button that did nothing. -->
+  <span id="status" role="status" aria-live="polite"></span>
 
   <ul id="recent" aria-label="recent captures"></ul>
   <div id="board" aria-label="board"></div>
@@ -333,7 +342,22 @@ function choreFields(box){
   return body;
 }
 
-async function chorePost(url, body, okMsg){
+// `where` is the box to show the failure in. The toast alone is not enough: it
+// fades after 2.6s, and it used to be inside .bar, which is hidden on this tab --
+// so a rejected chore looked exactly like a dead button.
+async function chorePost(url, body, okMsg, where){
+  const show = msg => {
+    if (!where) return;
+    let line = where.querySelector('.choreerr');
+    if (!line){
+      line = document.createElement('div');
+      line.className = 'cad choreerr';
+      where.appendChild(line);
+    }
+    line.textContent = msg || '';
+    line.style.display = msg ? '' : 'none';
+  };
+  show('');
   try{
     const r = await fetch(url, {method: body === null ? 'DELETE' : 'POST',
       headers:{...H,'Content-Type':'application/json'},
@@ -341,7 +365,7 @@ async function chorePost(url, body, okMsg){
     if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.detail || r.status); }
     say(okMsg); loadLists('upkeep');
     return true;
-  }catch(e){ say(e.message, true); return false; }
+  }catch(e){ say(e.message, true); show(e.message); return false; }
 }
 
 // Optimistic list edits. The DOM changes first and the request follows; a
@@ -522,22 +546,23 @@ function renderLists(which, data){
   $('lists').querySelectorAll('.task[data-slug]').forEach(li => {
     const slug = li.dataset.slug, url = '/upkeep/' + encodeURIComponent(slug);
     const on = (sel, fn) => { const b = li.querySelector(sel); if (b) b.onclick = fn; };
+    const acts = li.querySelector('.cadedit.acts');
+    const boxes = li.querySelectorAll('.cadedit');
+    const editor = boxes[boxes.length - 1];
     on('.sched', () => {
       const at = li.querySelector('.at');
-      chorePost(url + '/schedule', {at: at ? at.value : ''}, 'added to today');
+      chorePost(url + '/schedule', {at: at ? at.value : ''}, 'added to today', acts);
     });
-    on('.did', () => chorePost(url + '/done', {}, 'logged — the clock restarts today'));
+    on('.did', () => chorePost(url + '/done', {}, 'logged — the clock restarts today', acts));
     on('.snz', () => {
       const days = prompt('Snooze ' + slug + ' for how many days?', '3');
-      if (days) chorePost(url + '/snooze', {days: parseInt(days, 10)}, 'snoozed');
+      if (days) chorePost(url + '/snooze', {days: parseInt(days, 10)}, 'snoozed', acts);
     });
-    on('.save', () => {
-      const box = li.querySelectorAll('.cadedit');
-      chorePost(url + '/cadence', choreFields(box[box.length - 1]), 'cadence updated');
-    });
+    on('.save', () => chorePost(url + '/cadence', choreFields(editor),
+                                'cadence updated', editor));
     on('.kill', () => {
       if (confirm('Stop tracking “' + slug + '”? Its history is kept.'))
-        chorePost(url, null, 'no longer tracked');
+        chorePost(url, null, 'no longer tracked', editor);
     });
   });
 
@@ -545,11 +570,18 @@ function renderLists(which, data){
   if (nc) nc.onsubmit = ev => {
     ev.preventDefault();
     const box = nc.querySelector('.cadedit');
+    const err = m => {
+      let line = box.querySelector('.choreerr');
+      if (!line){ line = document.createElement('div'); line.className = 'cad choreerr';
+                  box.appendChild(line); }
+      line.textContent = m; line.style.display = '';
+      say(m, true);
+    };
     const title = box.querySelector('.title').value.trim();
-    if (!title) return say('a chore needs a name', true);
+    if (!title) return err('a chore needs a name');
     if (!box.querySelector('.every').value.trim())
-      return say('how often? e.g. 7d, 2w, 1m', true);
-    chorePost('/upkeep', {title, ...choreFields(box)}, 'chore added');
+      return err('how often? 7d, 2w, 1m — or just "weekly"');
+    chorePost('/upkeep', {title, ...choreFields(box)}, 'chore added', box);
   };
 
   // add an item, from inside the list it belongs to
@@ -585,8 +617,11 @@ function renderLists(which, data){
     };
   });
 
-  // delete a whole list
-  $('lists').querySelectorAll('.kill').forEach(b => {
+  // Delete a whole shopping list. Scoped to the list HEADER: a chore row also
+  // has a .kill (stop tracking this chore), and this loop runs after the chore
+  // wiring, so an unscoped selector overwrote that handler and a chore's x fired
+  // DELETE /lists/undefined instead.
+  $('lists').querySelectorAll('.lane > h2 .kill').forEach(b => {
     const sec = b.closest('.lane');
     b.onclick = async () => {
       const label = sec.querySelector('h2').childNodes[0].textContent.trim();

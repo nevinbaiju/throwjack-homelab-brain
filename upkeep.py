@@ -235,7 +235,7 @@ def _check(raw: dict, index: int) -> dict:
     if every is None:
         raise ChoreError(f"{title}: needs `every`, e.g. 7d / 2w / 1m")
     try:
-        parse_every(str(every))
+        every = canonical_every(str(every))
     except ChoreError as e:
         # Named, because these are read in the Upkeep tab after a hand edit and
         # "cannot read every 'sometimes'" does not say which chore to go and fix.
@@ -393,16 +393,40 @@ def save(chores: list[dict], path: Path | None = None) -> None:
 
 # --- the due engine: pure ---------------------------------------------------
 
+# What a person types when they are not thinking about a syntax. Worth having:
+# these are typed on a phone, and rejecting "weekly" taught nothing except that
+# the button does not work.
+WORD_EVERY = {
+    "daily": "1d", "every day": "1d", "nightly": "1d",
+    "weekly": "7d", "every week": "7d",
+    "fortnightly": "14d", "biweekly": "14d", "every fortnight": "14d",
+    "monthly": "1m", "every month": "1m",
+    "quarterly": "3m", "yearly": "12m", "annually": "12m", "every year": "12m",
+}
+
+
 def parse_every(spec: str) -> tuple[str, int]:
-    """'7d' -> ('d', 7). Also 2w, 1m, and the spelled-out forms."""
-    m = re.fullmatch(r"(\d+)\s*(d|w|m|day|days|week|weeks|month|months)",
-                     str(spec).strip().lower())
+    """'7d' -> ('d', 7). Also 2w, 1m, '14 days', 'every 2 weeks', 'weekly'."""
+    text = str(spec).strip().lower()
+    text = WORD_EVERY.get(text, text)
+    # "every 2 weeks" is the phrasing the old schema used, so it will be typed.
+    if text.startswith("every "):
+        text = WORD_EVERY.get(text, text[6:].strip())
+    m = re.fullmatch(r"(\d+)\s*(d|w|m|day|days|week|weeks|month|months)", text)
     if not m:
-        raise ChoreError(f"cannot read every {spec!r} -- use 7d, 2w or 1m")
+        raise ChoreError(
+            f"cannot read every {spec!r} -- use 7d, 2w or 1m "
+            f"(or daily / weekly / fortnightly / monthly)")
     n = int(m.group(1))
     if n < 1:
         raise ChoreError(f"every must be at least 1, got {spec!r}")
     return m.group(2)[0], n
+
+
+def canonical_every(spec: str) -> str:
+    """'weekly' -> '7d'. Stored canonical so the file reads one way."""
+    unit, n = parse_every(spec)
+    return f"{n}{unit}"
 
 
 def add_every(day: date, spec: str) -> date:

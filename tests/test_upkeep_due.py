@@ -31,7 +31,19 @@ check("1m parses", upkeep.parse_every("1m") == ("m", 1))
 check("'14 days' parses", upkeep.parse_every("14 days") == ("d", 14))
 check("2w == 14d", upkeep.add_every(date(2026, 9, 1), "2w")
                   == upkeep.add_every(date(2026, 9, 1), "14d"))
-for bad in ("weekly", "0d", "", "7x", "d7", "-3d"):
+# The words a person actually types. Rejecting these taught nothing except that
+# the button did not work -- and the message was invisible on the Upkeep tab.
+for text, want in (("weekly", "7d"), ("Weekly", "7d"), ("daily", "1d"),
+                   ("fortnightly", "14d"), ("biweekly", "14d"), ("monthly", "1m"),
+                   ("quarterly", "3m"), ("yearly", "12m"),
+                   ("every 2 weeks", "2w"), ("every 10 days", "10d"),
+                   ("every week", "7d"), ("  2W  ", "2w")):
+    got = upkeep.canonical_every(text)
+    check(f"{text!r} -> {want}", got == want, got)
+check("the stored form is always canonical",
+      upkeep._check({"title": "X", "every": "weekly"}, 0)["every"] == "7d")
+
+for bad in ("sometimes", "0d", "", "7x", "d7", "-3d", "every"):
     try:
         upkeep.parse_every(bad); check(f"{bad!r} rejected", False)
     except upkeep.ChoreError:
