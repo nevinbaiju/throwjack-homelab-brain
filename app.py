@@ -285,7 +285,7 @@ async def board(authorization: str | None = Header(default=None),
     conn = store.connect()
     try:
         lines = []
-        for lane in ("backlog", "in_progress", "waiting", "upkeep", "done"):
+        for lane in ("today", "backlog", "in_progress", "waiting", "done"):
             rows = store.active_tasks(conn, lane)
             if not rows:
                 continue
@@ -466,33 +466,37 @@ def _shop_collections() -> dict[str, str]:
             if c["collection"].startswith(SHOP_PREFIX)}
 
 
-def _chore_cadence() -> dict[str, dict]:
-    """{uid: {repeat, at, day}} from upkeep.yaml, keyed the way the VTODOs are."""
-    import upkeep
+def _upkeep_view() -> dict:
+    """Every chore with its state, for the Upkeep tab. No CalDAV involved.
+
+    Chores are no longer VTODOs in an Upkeep list, so this reads the YAML and the
+    upkeep_state table. Broken chores come back as `errors` rather than raising:
+    this file is hand-edited, and a typo must show up as a message on the tab
+    instead of a 500 that takes the shopping lists down with it.
+    """
+    import store, upkeep
+    conn = store.connect()
     try:
-        chores = upkeep.load()
-    except Exception as e:
-        print(f"[lists] upkeep.load: {type(e).__name__}: {e}", flush=True)
-        return {}
-    out = {}
-    for c in chores:
-        uid = upkeep.UID_PREFIX + upkeep._slug(c.get("title", ""))
-        out[uid] = {"repeat": c.get("repeat", "daily"), "at": c.get("at", ""),
-                    "day": upkeep.weekday_of(c) or "", "title": c.get("title", ""),
-                    "essential": bool(c.get("essential"))}
-    return out
+        chores, errors = upkeep.load_with_errors()
+        return {"chores": upkeep.all_states(conn), "errors": errors}
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[lists] upkeep: {type(e).__name__}: {e}", flush=True)
+        return {"chores": [], "errors": [f"{type(e).__name__}: {e}"]}
+    finally:
+        conn.close()
 
 
 @app.get("/lists.json")
 async def lists_json(authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Upkeep and the shopping lists, read straight from CalDAV.
+    """Upkeep from the brain, shopping lists from CalDAV.
 
-    Neither lives in SQLite. Upkeep items are VTODOs the brain writes with an
-    RRULE and iOS owns thereafter; the shop-* collections the brain never
-    touches except through this page.
+    Upkeep used to be read from a CalDAV collection too. It is now the chore file
+    plus upkeep_state, so this endpoint no longer depends on Radicale being up for
+    the Upkeep half -- which matters because a CalDAV failure used to 500 the
+    whole Lists tab, groceries included.
 
-    Completed items are dropped, not shown struck through: a shopping list you
+    Completed shopping items are dropped, not shown struck through: a list you
     have to scroll past yesterday's shopping to read is worse than one that
     just gets shorter.
     """
@@ -510,26 +514,23 @@ async def lists_json(authorization: str | None = Header(default=None),
             return []
 
     shop_map = _shop_collections()
-    upkeep_coll = bd.LANES["upkeep"][0]
-    colls = [upkeep_coll] + list(shop_map)
+    colls = list(shop_map)
 
     # Read every collection at once. Serially this was 2.1s for eight of them --
     # each is an independent HTTP round trip to Radicale, and waiting for one
     # before starting the next is the whole cost. They are pure reads, so there
     # is nothing to order.
-    with ThreadPoolExecutor(max_workers=min(8, len(colls))) as pool:
-        fetched = dict(zip(colls, pool.map(live, colls)))
-
-    cadence = _chore_cadence()
-    upkeep_items = []
-    for i in sorted(fetched[upkeep_coll], key=lambda i: i["summary"].lower()):
-        i["cadence"] = cadence.get(i["uid"])           # None for ones you added on the phone
-        upkeep_items.append(i)
+    fetched = {}
+    if colls:
+        with ThreadPoolExecutor(max_workers=min(8, len(colls))) as pool:
+            fetched = dict(zip(colls, pool.map(live, colls)))
 
     shops = [{"collection": c, "label": label,
               "items": sorted(fetched.get(c, []), key=lambda i: i["summary"].lower())}
              for c, label in sorted(shop_map.items(), key=lambda kv: kv[1].lower())]
-    return {"upkeep": upkeep_items, "shopping": shops}
+    view = _upkeep_view()
+    return {"upkeep": view["chores"], "upkeep_errors": view["errors"],
+            "shopping": shops}
 
 
 @app.post("/lists/add")
@@ -610,57 +611,280 @@ async def list_done(collection: str, uid: str,
     return {"ok": True, "uid": uid}
 
 
-@app.post("/upkeep/{uid}/cadence")
-async def upkeep_cadence(uid: str, request: Request,
+def _chore_fields(payload: dict, base: dict | None = None) -> dict:
+    """Payload -> a raw chore dict, validated. Raises HTTPException(400).
+
+    Everything the Upkeep tab writes goes through here, so the error you see next
+    to the field is the same sentence the loader would have produced.
+    """
+    import upkeep
+    raw = dict(base or {})
+    if "title" in payload:
+        raw["title"] = str(payload.get("title") or "").strip()
+    if "every" in payload:
+        raw["every"] = str(payload.get("every") or "").strip()
+    if "time_of_day" in payload:
+        raw["time_of_day"] = str(payload.get("time_of_day") or "").strip() or None
+    if "est_min" in payload:
+        raw["est_min"] = payload.get("est_min") or None
+    if "essential" in payload:
+        raw["essential"] = bool(payload.get("essential"))
+    if "escalate_after" in payload:
+        raw["escalate_after"] = str(payload.get("escalate_after") or "").strip() or None
+    # window and days are alternatives; setting either clears the other, or the
+    # chore would carry a stale constraint that days silently overrides.
+    if "days" in payload or "window" in payload:
+        raw.pop("days", None)
+        raw.pop("window", None)
+        days = payload.get("days")
+        window = str(payload.get("window") or "").strip().lower()
+        if days:
+            raw["days"] = [str(d).strip().lower() for d in days]
+        elif window and window not in ("", "any"):
+            raw["window"] = window
+    raw = {k: v for k, v in raw.items() if v is not None and v != ""}
+    try:
+        return upkeep._check(raw, 0)
+    except upkeep.ChoreError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/upkeep")
+async def upkeep_create(request: Request,
         authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Change one chore's cadence, then re-sync the Upkeep list.
+    """Add a chore. The id is derived from the title once and then fixed."""
+    _require_auth(authorization, session)
+    import upkeep
+    payload = await request.json()
+    chore = _chore_fields(payload)
+    chores = upkeep.load()
+    if any(c["slug"] == chore["slug"] for c in chores):
+        raise HTTPException(status_code=409,
+                            detail=f"a chore with id {chore['slug']!r} already exists")
+    upkeep.save(chores + [chore])
+    return {"ok": True, "slug": chore["slug"], "title": chore["title"]}
 
-    Writes upkeep.yaml on the volume, not the copy baked into the image, and
-    rewrites only the fields given. The header comments are preserved verbatim
-    and only the chores list below them is regenerated.
+
+@app.post("/upkeep/{slug}/cadence")
+async def upkeep_cadence(slug: str, request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Change one chore. Only the fields given are touched.
+
+    The id is never rewritten from a new title: upkeep_state is filed under it,
+    so renaming the title has to be free. The header comments are preserved and
+    only the chores list below them is regenerated.
     """
     _require_auth(authorization, session)
-    import upkeep, yaml as _yaml
+    import upkeep
     payload = await request.json()
-    repeat = str(payload.get("repeat", "")).strip()
-    at = str(payload.get("at", "")).strip()
-    day = str(payload.get("day", "")).strip().lower()
-    if not repeat:
-        raise HTTPException(status_code=400, detail="repeat is required")
-
-    path = upkeep.ensure_chores_file()
-    data = _yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    chores = data.get("chores") or []
-    target = None
-    for c in chores:
-        if upkeep.UID_PREFIX + upkeep._slug(c.get("title", "")) == uid:
-            target = c
-            break
+    chores = upkeep.load()
+    target = next((c for c in chores if c["slug"] == slug), None)
     if target is None:
-        raise HTTPException(status_code=404, detail="no such chore in upkeep.yaml")
+        raise HTTPException(status_code=404, detail="no such chore")
+    base = {"id": target["slug"], "title": target["title"], "every": target["every"]}
+    for key in ("window", "days", "time_of_day", "est_min", "escalate_after"):
+        if target.get(key):
+            base[key] = target[key]
+    if target.get("essential"):
+        base["essential"] = True
+    updated = _chore_fields(payload, base)
+    updated["slug"] = slug
+    upkeep.save([updated if c["slug"] == slug else c for c in chores])
+    return {"ok": True, "slug": slug, "every": updated["every"]}
 
-    target["repeat"] = repeat
-    if at:
-        target["at"] = at
-    if day:
-        target["day"] = day
-    elif "day" in target and not repeat.startswith("weekly"):
-        target.pop("day", None)
 
+@app.delete("/upkeep/{slug}")
+async def upkeep_delete(slug: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Stop tracking a chore. Its upkeep_state row is left alone.
+
+    Nothing is deleted from the database -- and because all_states() iterates the
+    YAML rather than the table, the orphaned row cannot bring the chore back.
+    """
+    _require_auth(authorization, session)
+    import upkeep
+    chores = upkeep.load()
+    if not any(c["slug"] == slug for c in chores):
+        raise HTTPException(status_code=404, detail="no such chore")
+    upkeep.save([c for c in chores if c["slug"] != slug])
+    return {"ok": True, "slug": slug}
+
+
+@app.post("/upkeep/{slug}/done")
+async def upkeep_done(slug: str, request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Record that a chore was done, whether or not it was ever scheduled.
+
+    Without this there is no way at all to log a chore you did spontaneously: the
+    phone list is gone, so last_done would only ever move when a scheduled
+    instance was ticked.
+    """
+    _require_auth(authorization, session)
+    import policy, project, store, upkeep
     try:
-        upkeep.parse_repeat(repeat, upkeep.weekday_of(target))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"unusable cadence: {e}")
+        payload = await request.json()
+    except Exception:                                        # noqa: BLE001
+        payload = {}
+    when = str(payload.get("on") or "").strip() or None
+    conn = store.connect()
+    try:
+        if upkeep.by_slug(slug) is None:
+            raise HTTPException(status_code=404, detail="no such chore")
+        day = policy.local_today()
+        upkeep.record_done(conn, slug, when or day)
+        inst = upkeep.instance_for(conn, slug, day)
+        if inst is not None and inst["status"] != "completed":
+            project.set_state(conn, inst["id"], "done")
+        row = upkeep.state_row(conn, slug)
+        return {"ok": True, "slug": slug, "last_done": row["last_done"]}
+    finally:
+        conn.close()
 
-    # Keep the header comments -- they explain the `day` vs `on` YAML trap and
-    # that quiet hours do not apply here -- and regenerate only the list below
-    # it. Verified there are no comments inside the chores block itself.
-    header = path.read_text(encoding="utf-8").split("chores:")[0]
-    path.write_text(header + _yaml.safe_dump({"chores": chores}, sort_keys=False,
-                                             allow_unicode=True), encoding="utf-8")
-    result = upkeep.sync()
-    return {"ok": True, "uid": uid, "repeat": repeat, "synced": result}
+
+@app.post("/upkeep/{slug}/snooze")
+async def upkeep_snooze(slug: str, request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Stop offering a chore until a date. `days` or an explicit `until`."""
+    _require_auth(authorization, session)
+    from datetime import timedelta
+    import policy, store, upkeep
+    payload = await request.json()
+    conn = store.connect()
+    try:
+        if upkeep.by_slug(slug) is None:
+            raise HTTPException(status_code=404, detail="no such chore")
+        until = str(payload.get("until") or "").strip()
+        if not until:
+            try:
+                days = max(1, min(int(payload.get("days") or 3), 365))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="days must be a number")
+            until = (policy.local_today() + timedelta(days=days)).isoformat()
+        try:
+            day = upkeep.snooze(conn, slug, until)
+        except upkeep.ChoreError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"ok": True, "slug": slug, "snooze_until": day.isoformat()}
+    finally:
+        conn.close()
+
+
+@app.post("/upkeep/{slug}/schedule")
+async def upkeep_schedule(slug: str, request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Put a chore on today at a time, without going through the planner."""
+    _require_auth(authorization, session)
+    from datetime import timedelta
+    import board as bd, caldav, policy, store, upkeep
+    payload = await request.json()
+    conn = store.connect()
+    try:
+        chore = upkeep.by_slug(slug)
+        if chore is None:
+            raise HTTPException(status_code=404, detail="no such chore")
+        now = policy.local_now()
+        try:
+            task_id = upkeep.materialise(conn, chore, str(payload.get("at") or ""),
+                                         day=now.date(), why="scheduled by hand")
+        except upkeep.ChoreError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        when = max(bd.intended_alarm(row) or now, now + timedelta(minutes=1))
+        try:
+            bd.write_task(conn, row, alarm_at=when)
+        except caldav.CalDavError as e:
+            print(f"[upkeep] schedule {slug}: {e}", flush=True)
+        return {"ok": True, "slug": slug, "task_id": task_id,
+                "scheduled_at": row["scheduled_at"]}
+    finally:
+        conn.close()
+
+
+@app.post("/upkeep/retire")
+async def upkeep_retire(dry: bool = True,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """One-shot: export the old Upkeep collection, mine last_done, then delete it.
+
+    An endpoint rather than a host script because CALDAV_URL is
+    http://radicale:5232 -- only reachable from inside the compose network.
+
+    Order matters and the export is the archive, so the delete refuses unless the
+    export actually wrote something. `dry=true` (the default) reports exactly what
+    it would do and writes nothing.
+    """
+    _require_auth(authorization, session)
+    import json as _json
+    import caldav, store, upkeep
+    from datetime import datetime as _dt
+
+    collection = "upkeep"
+    try:
+        items = caldav.list_todos(collection)
+    except caldav.CalDavError as e:
+        return {"ok": True, "note": f"no upkeep collection to retire ({e})"}
+
+    # Mine the most recent completion per title. iOS writes one VTODO instance
+    # per completion with a random uid, which the brain never read -- so this is
+    # the only record of when anything was actually last done.
+    mined: dict[str, str] = {}
+    today = store.datetime.now().date()
+    for item in items:
+        title = store.normalise_title(item.get("summary") or "")
+        stamp = caldav.parse_dt(item.get("completed_at") or "")
+        if not title or stamp is None or stamp.date() > today:
+            continue
+        got = stamp.date().isoformat()
+        if title not in mined or got > mined[title]:
+            mined[title] = got
+
+    conn = store.connect()
+    try:
+        chores = upkeep.load()
+        seeds = {c["slug"]: mined[store.normalise_title(c["title"])]
+                 for c in chores if store.normalise_title(c["title"]) in mined}
+        strays = [dict(r) for r in conn.execute(
+            "SELECT id, title, source_key, lane FROM tasks WHERE archived=0 AND "
+            "(caldav_collection='upkeep' OR lane='upkeep' OR source_key LIKE 'chore:%')")]
+        plan = {"items": len(items), "mined_titles": mined, "would_seed": seeds,
+                "db_rows_to_clean": strays}
+        if dry:
+            return {"ok": True, "dry_run": True, **plan}
+
+        archive_dir = store.BRAIN_ROOT / "archive"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        path = archive_dir / f"upkeep-{_dt.now():%Y%m%d-%H%M%S}.json"
+        path.write_text(_json.dumps(
+            {"exported_at": store.now_iso(), "collection": collection,
+             "items": items, "mined_last_done": mined}, indent=2, default=str),
+            encoding="utf-8")
+        if not items:
+            return {"ok": False, "detail": "export wrote no items; refusing to delete",
+                    "archive": str(path)}
+
+        for slug, day in seeds.items():
+            upkeep._touch_state(conn, slug, seed_done=day)
+            upkeep.record_done(conn, slug, day)
+        # Nudge rows are spent: the mechanism that made them is gone.
+        conn.execute("UPDATE tasks SET archived=1, updated_at=? WHERE archived=0 "
+                     "AND source_key LIKE 'chore:%'", (store.now_iso(),))
+        # Anything of ours parked in that collection loses its card pointer so the
+        # next audit re-pushes it to the lane it actually belongs to.
+        conn.execute("UPDATE tasks SET caldav_collection=NULL, caldav_etag=NULL "
+                     "WHERE caldav_collection='upkeep'")
+        conn.execute("UPDATE tasks SET lane='backlog', updated_at=? WHERE archived=0 "
+                     "AND lane='upkeep'", (store.now_iso(),))
+        caldav.delete_collection(collection)
+        return {"ok": True, "archive": str(path), "seeded": seeds,
+                "cleaned": len(strays), "deleted_collection": collection}
+    finally:
+        conn.close()
 
 
 @app.post("/repush")
@@ -736,32 +960,14 @@ async def sync_all(authorization: str | None = Header(default=None),
         conn.close()
 
 
-@app.post("/upkeep/sync")
-async def upkeep_sync(authorization: str | None = Header(default=None),
-        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Make the Upkeep list match upkeep.yaml.
-
-    Chores are not tasks: nothing enters the database and reconcile ignores
-    them. Only u_ items are touched, so anything else in that list is left
-    exactly as it is.
-    """
-    _require_auth(authorization, session)
-    import upkeep
-    try:
-        return upkeep.sync()
-    except upkeep.ChoreError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @app.get("/upcoming", response_class=PlainTextResponse)
 async def upcoming(authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
-    """Read-only: what is armed, what has escalated, what chores are overdue."""
+    """Read-only: what is armed, what has escalated, where every chore stands."""
     _require_auth(authorization, session)
-    from datetime import datetime
-    import board, caldav, escalate, store, upkeep
+    import policy, store, upkeep
 
-    now = datetime.now()
+    now = policy.local_now()
     conn = store.connect()
     try:
         lines = ["ARMED  (next alarm, escalation level)"]
@@ -775,39 +981,34 @@ async def upcoming(authorization: str | None = Header(default=None),
             late = "  OVERDUE" if when and when < now.isoformat() else ""
             lvl = f"  esc{r['escalations']}" if r["escalations"] else ""
             dis = "  dismissed-today" if r["dismissed_until"] and r["dismissed_until"] > now.isoformat() else ""
-            lines.append(f"  {when[5:16]}  [{r['track']:<7}] {r['title'][:44]}{lvl}{late}{dis}")
+            slot = f"  @{r['scheduled_at'][11:16]}" if r["scheduled_at"] else ""
+            lines.append(f"  {when[5:16]}  [{r['track']:<7}] {r['title'][:40]}{slot}{lvl}{late}{dis}")
 
-        lines += ["", "CHORES  (from the Upkeep list; the brain never writes these)"]
-        collection = board.LANES["upkeep"][0]
-        live = {i["uid"]: i for i in caldav.list_todos(collection)}
-        for chore in upkeep.load():
-            try:
-                uid, _ = upkeep.build(chore)
-            except upkeep.ChoreError:
-                continue
-            if uid not in live:
-                lines.append(f"  {chore['title'][:30]:<30} NOT ON THE BOARD — run ./brain.sh upkeep")
-                continue
-            raw = caldav._request("GET", caldav._url(collection, f"{uid}.ics"))[2].decode(
-                "utf-8", errors="replace")
-            due = escalate._due_of(raw)
-            mark = "essential" if chore.get("essential") else "         "
-            if due is None:
-                state = "no due date"
-            elif due > now:
-                state = f"due {due:%m-%d %H:%M}"
+        lines += ["", "CHORES  (cadence from upkeep.yaml, last done from the brain)"]
+        chores, errors = upkeep.load_with_errors()
+        if not chores and not errors:
+            lines.append("  (none yet — add them on the Upkeep tab)")
+        for c in upkeep.all_states(conn, now.date()):
+            mark = "essential" if c.get("essential") else "         "
+            if c["state"] == upkeep.DUE:
+                state = f"DUE  overdue {c['overdue_days']}d"
+                if c.get("missed_windows"):
+                    state += f", deferred {c['missed_windows']}x"
+            elif c["state"] == upkeep.WAITING:
+                state = f"waiting for its window, next {c['next_due']}"
+            elif c["state"] == upkeep.SNOOZED:
+                state = f"snoozed until {c['snooze_until']}"
+            elif c["state"] == "broken":
+                state = f"BROKEN: {c.get('error')}"
             else:
-                over = now - due
-                hrs = int(over.total_seconds() // 3600)
-                grace = escalate.grace_for(chore)
-                past = "past grace" if over > grace else "within grace"
-                state = f"OVERDUE {hrs}h ({past})"
-            nudge = conn.execute(
-                "SELECT title, escalations FROM tasks WHERE source_key=? AND archived=0",
-                (f"chore:{uid}",)).fetchone()
-            lines.append(f"  {chore['title'][:30]:<30} {mark}  {state}")
-            if nudge:
-                lines.append(f"       nudge esc{nudge['escalations']}: {nudge['title'][:56]}")
+                state = f"next {c['next_due']}"
+            last = f"  last {c['last_done']}" if c.get("last_done") else "  never done"
+            lines.append(f"  {c['title'][:28]:<28} every {str(c['every']):<4} {mark}  {state}{last}")
+            if c.get("scheduled_today"):
+                at = (c["scheduled_today"].get("at") or "")[11:16]
+                lines.append(f"       on today at {at} ({c['scheduled_today']['status']})")
+        for e in errors:
+            lines.append(f"  !! {e}")
         return "\n".join(lines) + "\n"
     finally:
         conn.close()
@@ -912,18 +1113,32 @@ async def plan_today_json(authorization: str | None = Header(default=None),
             "SELECT applied_at FROM plan_jobs WHERE applied_at IS NOT NULL"
             " ORDER BY applied_at DESC LIMIT 1").fetchone()
         planned_on = row["applied_at"][:10] if row else None
-        today_str = _dt.date.today().isoformat()
+        import policy as _policy
+        today_str = _policy.local_today().isoformat()
 
         def slim(r):
+            is_upkeep = str(r["source_key"] or "").startswith("upkeep:")
             return {"id": r["id"], "title": r["title"], "lane": r["lane"],
                     "blocked_on": r["blocked_on"], "project": r["project"],
+                    "is_upkeep": is_upkeep,
+                    "at": (r["scheduled_at"] or "")[11:16] or None,
+                    "estimate_min": r["estimate_min"],
+                    # A chore instance is created for one day and archived if it
+                    # outlives it, so it can never be "carried from" an earlier
+                    # day -- labelling it that way would be a lie on the screen.
                     "carried_from": (r["updated_at"][:10]
-                                     if r["lane"] == "today" and planned_on != today_str
+                                     if r["lane"] == "today" and not is_upkeep
+                                     and planned_on != today_str
                                      else None)}
 
         rows = conn.execute(
             "SELECT * FROM tasks WHERE archived=0 AND status!='completed'"
-            " AND lane IN ('today','in_progress','backlog') ORDER BY seq, score DESC"
+            " AND lane IN ('today','in_progress','backlog')"
+            # Slotted things first, in time order: a day with "laundry at 19:00"
+            # in it reads as a schedule. today_seq preserves the order the plan
+            # was accepted in; `seq` is project ordering and is not ours to use.
+            " ORDER BY scheduled_at IS NULL, scheduled_at,"
+            " today_seq IS NULL, today_seq, seq, score DESC"
         ).fetchall()
         # A finished plan you have neither accepted nor discarded. It used to
         # exist only in the page's memory, so a reload or a dropped connection
@@ -973,12 +1188,34 @@ async def plan_today_json(authorization: str | None = Header(default=None),
                 "rejected": stale,           # detail, for debugging only
             }
 
+        # Chores due today, so the planning screen can offer them first. Read
+        # from the engine, never from a lane -- there is no upkeep lane any more.
+        import upkeep as _upkeep
+        try:
+            states = _upkeep.all_states(conn)
+            upkeep_due = [
+                {"slug": c["slug"], "title": c["title"], "every": c["every"],
+                 "overdue_days": c["overdue_days"], "last_done": c["last_done"],
+                 "missed_windows": c["missed_windows"],
+                 "est_min": c.get("est_min"), "time_of_day": c.get("time_of_day")}
+                for c in states
+                if c["state"] == _upkeep.DUE and not c.get("scheduled_today")]
+            upkeep_waiting = [
+                {"slug": c["slug"], "title": c["title"], "next_due": c["next_due"],
+                 "overdue_days": c["overdue_days"]}
+                for c in states if c["state"] == _upkeep.WAITING]
+        except Exception as e:                               # noqa: BLE001
+            print(f"[plan] upkeep states: {type(e).__name__}: {e}", flush=True)
+            upkeep_due, upkeep_waiting = [], []
+
         return {
             "date": today_str,
             "planned_on": planned_on,
             "is_current": planned_on == today_str,
             "working": working,
             "pending": pending,
+            "upkeep_due": upkeep_due,
+            "upkeep_waiting": upkeep_waiting,
             "today": [slim(r) for r in rows if r["lane"] == "today"],
             "pool": [slim(r) for r in rows if r["lane"] != "today"],
         }
@@ -1187,6 +1424,14 @@ async def plan_apply(payload: dict, background: BackgroundTasks,
             raise HTTPException(status_code=409, detail="already applied")
         if row["dismissed_at"]:
             raise HTTPException(status_code=409, detail="already discarded")
+        # A plan is for a day. Applying yesterday's would move yesterday's picks
+        # onto today and, worse, schedule chores under today's date from a
+        # proposal written against a board that has since moved on.
+        import policy as _policy
+        if (row["created_at"] or "")[:10] != _policy.local_today().isoformat():
+            raise HTTPException(
+                status_code=409,
+                detail="that plan was made on a different day -- ask for a new one")
 
         # Re-validate against the board as it is NOW, not as it was when the
         # plan was written. A draft can sit for minutes or days, and in between

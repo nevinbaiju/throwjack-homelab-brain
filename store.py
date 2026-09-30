@@ -19,7 +19,12 @@ DB_PATH = BRAIN_ROOT / "state" / "brain.db"
 TRACKS = ("meta", "focus", "flow", "waiting", "upkeep", "someday")
 LANE_FOR_TRACK = {
     "meta": "backlog", "focus": "backlog", "flow": "backlog",
-    "waiting": "waiting", "upkeep": "upkeep", "someday": "backlog",
+    # `upkeep` is a track, not a lane. There is no upkeep lane any more: a chore
+    # is policy plus state (upkeep.yaml + the upkeep_state table) and becomes a
+    # real task only for the day it is scheduled, which puts it in `today`. A
+    # capture triaged as upkeep -- "take the bins out" -- is an ordinary task and
+    # belongs in the backlog like any other.
+    "waiting": "waiting", "upkeep": "backlog", "someday": "backlog",
 }
 
 SCHEMA = """
@@ -118,6 +123,32 @@ CREATE TABLE IF NOT EXISTS plan_jobs (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Chores. The cadence lives in upkeep.yaml; this is the part that changes when
+-- you actually do one, which is what "next due" is measured from. A chore has no
+-- row here until something happens to it, so first_seen is what a never-done
+-- chore is anchored on -- a `start:` key in the YAML would let an edit
+-- retroactively make something four hundred days overdue.
+CREATE TABLE IF NOT EXISTS upkeep_state (
+    slug         TEXT PRIMARY KEY,
+    last_done    TEXT,
+    seed_done    TEXT,          -- mined from the retired Upkeep list; a floor
+    first_seen   TEXT,
+    snooze_until TEXT,
+    updated_at   TEXT NOT NULL
+);
+"""
+
+# Indexes over columns that MIGRATIONS adds. These cannot go in SCHEMA:
+# executescript(SCHEMA) runs before _migrate(), so on a fresh database the column
+# does not exist yet and CREATE INDEX fails with "no such column".
+#
+# idx_tasks_source is deliberately NOT unique. A partial unique index over
+# (source_key) WHERE archived=0 makes archive/un-archive ordering raise
+# IntegrityError halfway through, and isolation_level=None means there is no
+# transaction to roll back. upkeep.materialise() enforces one-instance-per-day.
+POST_MIGRATE = """
+CREATE INDEX IF NOT EXISTS idx_tasks_source ON tasks(source_key);
 """
 
 
@@ -152,6 +183,15 @@ MIGRATIONS = [
     # was never written to the board, so recording it as applied would be a
     # lie, and leaving it null makes it resurface forever.
     ("plan_jobs", "dismissed_at", "TEXT"),
+    # When a task is meant to happen today, to the minute. `due` is date-only and
+    # board.write_task hardcodes T09:00:00, so widening it would touch write_task,
+    # alarm_time_for, the triage prompt contract and score.py. Chore instances set
+    # both: scheduled_at for the alarm, due for the urgency term.
+    ("tasks", "scheduled_at", "TEXT"),
+    # Order within Today, as you accepted it. NOT `seq` -- project.dump writes
+    # that as within-project ordering and project.promote orders by it, so
+    # writing a global 0..N here would perturb which task gets promoted next.
+    ("tasks", "today_seq", "INTEGER"),
 ]
 
 
@@ -169,6 +209,7 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     _migrate(conn)
+    conn.executescript(POST_MIGRATE)
     return conn
 
 
@@ -256,7 +297,12 @@ def find_duplicate(conn, title: str, track: str) -> str | None:
     if not target:
         return None
     for row in conn.execute(
-        "SELECT id, title FROM tasks WHERE archived=0 AND status!='completed' AND track=?",
+        # A chore instance is excluded on purpose. It is track='upkeep' with the
+        # chore's exact title, so capturing "laundry" on a day laundry is already
+        # scheduled would attach the capture to today's instance -- which then
+        # gets archived overnight, taking the capture with it.
+        "SELECT id, title FROM tasks WHERE archived=0 AND status!='completed' "
+        "AND track=? AND (source_key IS NULL OR source_key NOT LIKE 'upkeep:%')",
         (track,),
     ):
         if normalise_title(row["title"]) == target:

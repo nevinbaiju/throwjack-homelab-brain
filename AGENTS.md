@@ -15,8 +15,9 @@ thought of the obvious one. Read "Design rules" before changing behaviour.
     llm.py       LiteLLM client + strict schema validation of model output
     board.py     the CalDAV projection: lanes, reconcile, inbox drain
     caldav.py    hand-rolled CalDAV/iCalendar client
-    upkeep.py    recurring chores (RRULE). NOT tasks — see below
-    escalate.py  re-arming alarms, and nudges for overdue essential chores
+    upkeep.py    recurring chores: the due engine, state and overnight sweep.
+                 Imports no CalDAV on purpose, so it is testable on the host
+    escalate.py  re-arming alarms, and scheduling badly-overdue essential chores
     score.py     priority: one stored input, everything else derived
     policy.py    quiet hours
     store.py     SQLite — the system of record
@@ -51,11 +52,27 @@ Short version:
   phone, the database follows them. Never revert their change.
 - **Two gestures, two meanings.** Ticking a reminder completes the task.
   *Deleting* one dismisses the nudge and leaves the task alone.
-- **Chores are not tasks.** Recurring `u_` items live in the Upkeep list; iOS
-  owns their recurrence and completion. The brain reads them, never writes to
-  them. Holding a chore as a task fights iOS's recurrence handling.
+- **Chores are policy plus state, not standing cards.** `upkeep.yaml` holds the
+  cadence; the `upkeep_state` table holds `last_done`. A chore becomes a real
+  task only for the day it is scheduled, and that instance is **archived** if the
+  day ends without it done — so not doing one costs nothing and it simply comes
+  back. The brain owns the recurrence; iOS owns nothing.
+  This used to be the opposite ("chores are not tasks, iOS owns them"), and it
+  was wrong for one reason: iOS advances a recurrence from the previous DUE date,
+  so finishing a fortnightly chore four days late made the next one due in ten
+  days rather than fourteen. Cadence has to be measured from what you actually
+  did. Do not put it back.
+- **Due is `last_done + every`.** Never a fixed weekday. A chore with a `window`
+  that misses its window waits for the next one instead of nagging on a day it
+  cannot be done.
 - **Escalation adds precision, not volume.** The text gets more specific; the
-  notification count does not climb, and it stops after four attempts.
+  notification count does not climb, and it stops after four attempts. For a
+  chore it means *scheduling* it into today, not raising a second card about it.
+- **Two gestures, two meanings, for a chore too.** Ticking a chore instance
+  completes it and moves `last_done`. *Deleting* the card means "not today": the
+  instance is archived and the chore stays due, which is the same outcome as the
+  overnight sweep. `board.audit` must keep honouring `dismissed_until`, or a
+  swipe is silently undone within ten minutes.
 - **Track everything, surface a little.** Caps control what is loud, never what
   is tracked.
 
@@ -77,6 +94,15 @@ Worth knowing before you spend an evening on them:
 
 ## Testing
 
-There is no test runner checked in; tests were written per-change against a
-scratch database and scratch CalDAV collections. If you add tests, keep that
-property: **a test must never touch the real board or the real database.**
+    bash tests/run            # host: scratch sqlite, no network, no CalDAV
+    bash tests/run-in-brain   # the endpoint tests, inside the container
+
+`tests/run` is where new work belongs: `upkeep.py` deliberately imports neither
+`board` nor `caldav`, so the entire due engine, state machine and overnight sweep
+run there in under a second. Endpoint tests that need FastAPI go in
+`tests/run-in-brain`, which refuses to start unless `BRAIN_ROOT` is under `/tmp`.
+
+Keep the property that matters: **a test must never touch the real board or the
+real database.** Stub `board.write_task` / `board.remove_task` rather than letting
+a test reach Radicale — a test in this tree once PUT to the live server and was
+saved only by a 401.

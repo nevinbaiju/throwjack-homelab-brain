@@ -29,7 +29,6 @@ LANES: dict[str, tuple[str, str]] = {
     "backlog":     ("backlog", "Backlog"),
     "in_progress": ("in-progress", "In Progress"),
     "done":        ("done", "Done"),
-    "upkeep":      ("upkeep", "Upkeep"),
 }
 
 # The brain has a `waiting` lane (handed off, blocked on someone else) but you
@@ -37,7 +36,14 @@ LANES: dict[str, tuple[str, str]] = {
 # track stays `waiting` in the database, so chase intervals still work, and the
 # item body says who you are waiting on. Backlog rather than In Progress on
 # purpose: blocked work sitting in In Progress inflates how loaded you look.
-LANE_ALIASES = {"waiting": "backlog"}
+#
+# `upkeep` is aliased rather than simply deleted. collection_for() raises KeyError
+# on an unknown lane -- not CalDavError -- so every `except caldav.CalDavError`
+# around a board write misses it, and one surviving row with lane='upkeep' would
+# kill reconcile, the inbox drain and triage outright. The alias is a permanent
+# net, not the migration: reconcile() repoints such rows below, because an aliased
+# lane is invisible to same_lane() and to every planner query.
+LANE_ALIASES = {"waiting": "backlog", "upkeep": "backlog"}
 
 
 def collection_for(lane: str) -> str:
@@ -98,12 +104,13 @@ def write_task(conn, row, *, alarm_at: datetime | None = None) -> None:
     if row["project"]:
         body.append(f"project: {row['project']}")
 
-    due = None
-    if row["due"]:
-        try:
-            due = datetime.fromisoformat(row["due"] + "T09:00:00").astimezone()
-        except ValueError:
-            due = None
+    # scheduled_at wins: it is a real wall-clock slot ("laundry at 19:00"),
+    # whereas `due` is date-only and this used to hardcode 09:00 for everything.
+    due = _when(row)
+    if due is not None:
+        due = due.astimezone()
+    if row["scheduled_at"]:
+        body.insert(0, f"at {row['scheduled_at'][11:16]}")
 
     ics = caldav.build_vtodo(
         row["id"], row["title"], due=due, alarm_at=alarm_at,
@@ -138,6 +145,24 @@ def remove_task(conn, row) -> None:
                  (row["id"],))
 
 
+def _when(row) -> datetime | None:
+    """The moment this task is meant to happen. scheduled_at, else due at 09:00.
+
+    One definition, used by write_task and alarm_time_for both. Without it a
+    chore instance carrying only scheduled_at got no DUE and therefore no alarm,
+    and intended_alarm() fell through to last_alarm_at (NULL on a fresh row), so
+    the audit computed want_alarm=False and never self-healed.
+    """
+    for raw in (row["scheduled_at"], (row["due"] + "T09:00:00") if row["due"] else None):
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def alarm_time_for(row, cfg: dict | None = None) -> datetime | None:
     """When this task's reminder should fire, respecting quiet hours.
 
@@ -145,13 +170,12 @@ def alarm_time_for(row, cfg: dict | None = None) -> datetime | None:
     what trigger we write, so a work item due at 23:00 gets an alarm at 10:00
     the next morning and "held, never dropped" falls out with no queue.
     """
-    if not row["due"] or row["status"] == "completed":
+    if row["status"] == "completed":
+        return None
+    due = _when(row)
+    if due is None:
         return None
     cfg = cfg or policy.load_config()
-    try:
-        due = datetime.fromisoformat(row["due"] + "T09:00:00")
-    except ValueError:
-        return None
     return policy.next_open(row["track"], due, cfg)
 
 
@@ -286,11 +310,13 @@ def reconcile(conn) -> dict:
                 result["completed"] += 1
                 if lane != "done":
                     newly_done.append(task_id)
+                _note_chore(conn, task_id, done=True)
             elif not done and row["status"] == "completed":
                 conn.execute(
                     "UPDATE tasks SET status='needs_action', completed_at=NULL WHERE id=?",
                     (task_id,))
                 result["reopened"] += 1
+                _note_chore(conn, task_id, done=False)
 
             title = (item["summary"] or "").strip()
             if title and title != row["title"]:   # you rewrote it on the phone
@@ -319,14 +345,47 @@ def reconcile(conn) -> dict:
     # Gone from the list but still live in the database: you swiped it away.
     # That dismisses the reminder for today. It does NOT touch the task.
     for row in conn.execute(
-            "SELECT id FROM tasks WHERE archived=0 AND status!='completed' "
-            "AND caldav_collection IS NOT NULL"):
-        if row["id"] not in seen:
-            conn.execute(
-                "UPDATE tasks SET caldav_collection=NULL, caldav_etag=NULL, dismissed_until=? "
-                "WHERE id=?", (_end_of_day(), row["id"]))
+            "SELECT * FROM tasks WHERE archived=0 AND status!='completed' "
+            "AND caldav_collection IS NOT NULL").fetchall():
+        if row["id"] in seen:
+            continue
+        if str(row["source_key"] or "").startswith("upkeep:"):
+            # Swiping a chore away means "not today", which is the same outcome
+            # as the overnight sweep: the instance goes, the chore stays due and
+            # asks again. Dismissing it instead would leave a live today-lane row
+            # with no card, which the audit then re-pushes.
+            import upkeep
+            upkeep.archive_instance(conn, row, "dismissed on the phone")
             result["dismissed"] += 1
+            continue
+        conn.execute(
+            "UPDATE tasks SET caldav_collection=NULL, caldav_etag=NULL, dismissed_until=? "
+            "WHERE id=?", (_end_of_day(), row["id"]))
+        result["dismissed"] += 1
+
+    # Self-heal any row left in the retired `upkeep` lane. LANE_ALIASES keeps
+    # collection_for() from raising on one, but an aliased lane is invisible to
+    # same_lane() and to every planner query -- so without this the row is a
+    # silent black hole rather than a crash.
+    stranded = conn.execute(
+        "UPDATE tasks SET lane='backlog', updated_at=? WHERE archived=0 AND lane='upkeep'",
+        (store_now(),)).rowcount
+    if stranded:
+        result["repointed_from_upkeep"] = stranded
     return result
+
+
+def _note_chore(conn, task_id: str, *, done: bool) -> None:
+    """Keep upkeep_state in step with a completion made on the phone."""
+    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if row is None:
+        return
+    try:
+        import upkeep
+        upkeep.note_completion(conn, row) if done else upkeep.note_reopened(conn, row)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[reconcile] upkeep state for {task_id}: {type(e).__name__}: {e}",
+              flush=True)
 
 
 def drain_inbox(conn) -> list[str]:

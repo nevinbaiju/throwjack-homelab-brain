@@ -6,10 +6,19 @@ Two mechanisms, because tasks and chores are different animals:
   tasks   the brain owns them, so it RE-ARMS the alarm. Escalation is a new
           VALARM at a later time, not a second notification service.
 
-  chores  the brain does NOT own them — iOS runs the recurrence, and touching
-          them would fight it. So the brain reads the Upkeep list, notices an
-          essential chore is badly overdue, and raises a SEPARATE nudge task.
-          The chore itself is never modified.
+  chores  the brain owns the recurrence now. An `essential` chore that is badly
+          overdue gets SCHEDULED into today with a real time slot, which rings
+          because today-lane rows carry alarms.
+
+That second mechanism replaces the nudge cards. A nudge was a separate task
+saying "Laundry has been waiting 4h ago. Do it, or drop it from upkeep.yaml." --
+volume rather than precision, and it was silently broken three ways: it matched
+the same rows as escalate_tasks so the two ladders raced to the cap within two
+passes, rescore_and_sync then re-pushed the card with intended_alarm() = None and
+stripped the alarm the escalator had just set, and every chore marked essential
+was one of the daily reminders that has since been deleted. Doing the thing you
+would have done -- putting it on today at a time -- is one mechanism instead of
+two, and it is the only one that actually notifies.
 
 Escalation adds precision, not volume. After ESCALATION_CAP re-arms the brain
 stops: something nagged six times and still not done is information, not an
@@ -19,8 +28,7 @@ which costs you every future alert too.
 
 from __future__ import annotations
 
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 import board
 import caldav
@@ -34,76 +42,31 @@ ESCALATION_CAP = 4
 # stops re-arming and waits for the weekly review instead.
 BACKOFF = [timedelta(hours=2), timedelta(hours=6), timedelta(days=1), timedelta(days=3)]
 
-DEFAULT_GRACE = {"daily": timedelta(hours=4)}
-OTHER_GRACE = timedelta(days=2)
-
-
-def _parse_ics_dt(value: str) -> datetime | None:
-    """-> naive local datetime, or None. Accepts the three forms iOS emits.
-
-        20260928T120000Z    UTC
-        20260928T120000     floating or TZID-qualified -- already local wall clock
-        20260928            VALUE=DATE, which iOS uses for an all-day due date
-
-    Only the first was accepted before, so every all-day DUE read as "no due
-    date at all". And the UTC conversion was wrong: adding (now() - utcnow())
-    applies TODAY's offset, so a September timestamp read in January came out an
-    hour off. astimezone() uses the offset in force at that instant instead.
-    """
-    value = (value or "").strip()
-    m = re.match(r"^(\d{8})(?:T(\d{6})(Z?))?$", value)
-    if not m:
-        return None
-    day, clock, zulu = m.group(1), m.group(2), m.group(3)
-    try:
-        stamp = datetime.strptime(day + (clock or "000000"), "%Y%m%d%H%M%S")
-    except ValueError:
-        return None
-    if zulu == "Z":
-        stamp = stamp.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
-    return stamp
-
-
-def _due_of(raw_ics: str) -> datetime | None:
-    for line in caldav._unfold(raw_ics):
-        if line.upper().startswith("DUE"):
-            return _parse_ics_dt(line.partition(":")[2])
-    return None
-
-
-def grace_for(chore: dict) -> timedelta:
-    explicit = chore.get("escalate_after")
-    if explicit:
-        m = re.fullmatch(r"(\d+)\s*([hd])", str(explicit).strip().lower())
-        if m:
-            n = int(m.group(1))
-            return timedelta(hours=n) if m.group(2) == "h" else timedelta(days=n)
-    return DEFAULT_GRACE.get(str(chore.get("repeat", "")).strip().lower(), OTHER_GRACE)
-
-
-def nudge_text(title: str, overdue: timedelta, level: int) -> str:
-    """Getting louder means getting more specific, never more insistent."""
-    hours = int(overdue.total_seconds() // 3600)
-    if hours < 24:
-        late = f"{hours}h ago" if hours else "just now"
-    else:
-        late = f"{hours // 24}d ago"
-    if level <= 1:
-        return f"{title} — due {late}"
-    if level == 2:
-        return f"Still not done: {title}, due {late}"
-    return f"{title} has been waiting {late}. Do it, or drop it from upkeep.yaml."
+# Where an auto-scheduled chore lands when the chore names a rough time of day.
+# Nothing before 10:00: that is when the upkeep notification window opens, so an
+# earlier slot would just be held until then anyway.
+SLOT_FOR_TIME_OF_DAY = {
+    "morning": "10:00", "midday": "12:00", "noon": "12:00",
+    "afternoon": "15:00", "evening": "19:00", "night": "21:00", "late": "21:00",
+}
+DEFAULT_SLOT = "18:00"
 
 
 def escalate_tasks(conn, now: datetime | None = None, cfg: dict | None = None) -> dict:
     """Re-arm the alarm on anything whose reminder passed unanswered."""
-    now = now or datetime.now()
+    now = now or policy.local_now()
     cfg = cfg or policy.load_config()
     result = {"rearmed": 0, "capped": 0}
 
     for row in conn.execute(
             "SELECT * FROM tasks WHERE archived=0 AND status!='completed' "
-            "AND caldav_collection IS NOT NULL AND last_alarm_at IS NOT NULL"):
+            "AND caldav_collection IS NOT NULL AND last_alarm_at IS NOT NULL "
+            # Chore instances are excluded. The ladder runs to +3d, which would
+            # outlive the day whose instance is archived overnight -- leaving an
+            # alarm for a card that no longer exists. A chore that was not done
+            # today comes back through the due engine tomorrow instead, which is
+            # the whole design.
+            "AND (source_key IS NULL OR source_key NOT LIKE 'upkeep:%')"):
         fired = _iso(row["last_alarm_at"])
         if fired is None or fired > now:
             continue                                   # not due yet
@@ -127,87 +90,66 @@ def escalate_tasks(conn, now: datetime | None = None, cfg: dict | None = None) -
     return result
 
 
+def slot_for(chore: dict) -> str:
+    key = str(chore.get("time_of_day") or "").strip().lower()
+    return SLOT_FOR_TIME_OF_DAY.get(key, DEFAULT_SLOT)
+
+
 def escalate_chores(conn, now: datetime | None = None, cfg: dict | None = None) -> dict:
-    """Raise a nudge task for an essential chore that is badly overdue.
+    """Put a badly-overdue essential chore on today, with a time.
 
-    Reads the Upkeep list; never writes to it. The chore keeps its recurrence
-    and its own alarm, untouched.
+    Only `essential` chores. A plain chore that is overdue is not an emergency:
+    it keeps being offered at planning time and waits, indefinitely if that is
+    what you choose. Nothing here interrupts you for one.
     """
-    now = now or datetime.now()
+    now = now or policy.local_now()
     cfg = cfg or policy.load_config()
-    collection = board.LANES["upkeep"][0]
-    result = {"raised": 0, "cleared": 0, "watched": 0}
+    today = now.date()
+    result = {"scheduled": 0, "watched": 0, "already": 0}
 
-    # A hand-edited upkeep.yaml is a normal event, not an emergency. Neither this
-    # nor the per-chore GET below was guarded, so a typo in the chore file, or a
-    # few seconds of Radicale being unreachable, raised out of run() and stopped
-    # reconcile and triage too.
     try:
-        chores = upkeep.load()
-    except Exception as e:
+        states = upkeep.all_states(conn, today)
+    except Exception as e:                                   # noqa: BLE001
         print(f"[escalate] cannot read chores: {type(e).__name__}: {e}", flush=True)
         return dict(result, error=f"{type(e).__name__}: {e}")
 
-    by_uid = {}
-    for chore in chores:
-        try:
-            uid, _ = upkeep.build(chore)
-        except upkeep.ChoreError:
-            continue
-        by_uid[uid] = chore
-
-    # A `live` dict was built here from list_todos() and then never read -- an
-    # unguarded round trip per pass for nothing. The per-chore GET below is what
-    # actually reads the due date.
-    for uid, chore in by_uid.items():
-        if not chore.get("essential"):
+    for chore in states:
+        if not chore.get("essential") or chore.get("state") != upkeep.DUE:
             continue
         result["watched"] += 1
-        source_key = f"chore:{uid}"
-        existing = store.task_by_source(conn, source_key)
+        if chore.get("scheduled_today"):
+            result["already"] += 1
+            continue
+        if timedelta(days=chore.get("overdue_days") or 0) <= upkeep.escalation_grace(chore):
+            continue
 
         try:
-            raw = caldav._request("GET", caldav._url(collection, f"{uid}.ics"))[2].decode(
-                "utf-8", errors="replace")
-        except Exception as e:
-            print(f"[escalate] cannot read chore {uid}: {type(e).__name__}: {e}", flush=True)
-            continue                        # one unreadable chore, not the whole pass
-        due = _due_of(raw)
-        overdue = (now - due) if due else timedelta(0)
-        late_enough = due is not None and overdue > grace_for(chore)
-
-        if not late_enough:
-            if existing:                    # you did it — the nudge is spent
-                conn.execute("UPDATE tasks SET archived=1, updated_at=? WHERE id=?",
-                             (store.now_iso(), existing["id"]))
-                board.remove_task(conn, existing)
-                result["cleared"] += 1
+            task_id = upkeep.materialise(
+                conn, chore, slot_for(chore), day=today, automatic=True,
+                why=f"overdue {chore['overdue_days']}d, scheduled for you")
+        except upkeep.ChoreError as e:
+            print(f"[escalate] chore {chore['slug']}: {e}", flush=True)
+            continue
+        if task_id is None:
+            # An instance already exists for today, archived or not. Archived
+            # means you dismissed it or the sweep took it; re-creating it here is
+            # how "it disappeared overnight" becomes "it came back in ten
+            # minutes", which is the behaviour that makes people mute a list.
+            result["already"] += 1
             continue
 
-        level = (existing["escalations"] or 0) + 1 if existing else 1
-        if level > ESCALATION_CAP:
-            continue
-        title = nudge_text(chore["title"], overdue, level)
-        when = policy.next_open("upkeep", now, cfg) or now
-
-        if existing:
-            conn.execute(
-                "UPDATE tasks SET title=?, escalations=?, last_alarm_at=?, updated_at=? WHERE id=?",
-                (title, level, when.isoformat(timespec="seconds"), store.now_iso(), existing["id"]))
-            task_id = existing["id"]
-        else:
-            task_id = store.create_task(
-                conn, title=title, track="upkeep", lane="upkeep", consequence="breaks",
-                estimate_min=15, note=f"recurring chore: {chore['title']}")
-            conn.execute(
-                "UPDATE tasks SET source_key=?, escalations=?, last_alarm_at=? WHERE id=?",
-                (source_key, level, when.isoformat(timespec="seconds"), task_id))
         fresh = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        when = board.intended_alarm(fresh, cfg) or now
+        # Clamp forward. policy.next_open searches from `when`, so a slot earlier
+        # in the day returns that past time, and a VALARM in the past either
+        # fires on sync or never. project.promote does the same thing for the same
+        # reason.
+        when = max(when, now + timedelta(minutes=1))
         try:
             board.write_task(conn, fresh, alarm_at=when)
-            result["raised"] += 1
+            result["scheduled"] += 1
         except caldav.CalDavError as e:
-            print(f"[escalate] chore {uid}: {e}", flush=True)
+            print(f"[escalate] chore {chore['slug']}: {e}", flush=True)
     return result
 
 

@@ -1,63 +1,38 @@
-# Recurring chores. YOURS to edit — the brain writes these into the Upkeep
-# list and then leaves them alone. They are NOT tasks: they never enter the
-# database, never appear on the board, and reconcile ignores them entirely.
-# iOS owns the recurrence, the alarm and the completion.
+# Recurring chores. YOURS to edit -- by hand here, or from the Upkeep tab.
 #
-# Because they bypass the brain, quiet hours do NOT apply. "Go to sleep" at
-# 00:00 fires at 00:00, which is what you asked for.
+# The brain owns the recurrence. A chore is not a standing card: it becomes a
+# real task only for the day you schedule it, and that instance disappears
+# overnight if you did not do it. Nothing here is ever pushed to your phone until
+# it is scheduled into a day.
 #
-#   at:      HH:MM, 24-hour, local time
-#   repeat:  daily | weekly | monthly | every N weeks | every N days
-#   day:     weekday, for weekly repeats (monday..sunday)
-#            Spell it `day`, not `on` — YAML treats `on` as a boolean, so
-#            `on: friday` silently loses the weekday. `on` is accepted anyway.
-#   alarm:   true (default) fires a notification; false is a silent checklist item
+# Due is measured from WHEN YOU LAST DID IT, not from a calendar slot:
 #
-#   essential:       true means the brain speaks up when this goes badly
-#                    overdue. Default false — a non-essential chore never
-#                    interrupts you, it just sits in the list looking overdue.
-#   escalate_after:  how long past due before it says anything. Default 4h for
-#                    daily chores, 2d for anything less frequent.
+#     next due = last done + every
+#
+# so finishing a 14d chore four days late means the next one is due fourteen days
+# from then, not ten. A chore you have never done is due the day you add it.
+#
+#   id:           stable identifier. Keep it fixed -- it is what `last done` is
+#                 filed under, so changing it makes the chore look never-done.
+#                 Renaming `title` is always safe.
+#   title:        what you see on the card.
+#   every:        7d | 2w | 1m. Months clamp: the 31st + 1m is the 28th/29th.
+#   window:       weekend | weekday -- the only days this chore may land on.
+#   days:         [sat, sun] instead, for anything `window` cannot say.
+#                 Spell it `days`, never `on` -- YAML reads `on` as a boolean.
+#   time_of_day:  free text hint for the planner, e.g. morning / evening.
+#   est_min:      how long it takes. Under 15 minutes sorts a little higher.
+#   essential:    true lets the brain schedule it for you once it is badly
+#                 overdue. Default false: it waits to be picked, forever if need be.
+#   escalate_after: how long past due before that happens. Default 2d.
+#
+# Missing a window defers to the next one: a weekend chore that comes due on
+# Saturday and is skipped waits for the following Saturday rather than nagging on
+# Tuesday. A chore with no window stays due every day, with the overdue count
+# climbing, until you do it.
+#
+# Not implemented, noted so nobody invents a spelling for it: `skip_cycle`, for
+# "forget this one, come back next month" on a chore with no window.
 
-chores:
-  - title: Have breakfast
-    essential: true
-    at: "11:00"
-    repeat: daily
-
-  - title: Have lunch
-    essential: true
-    at: "15:00"
-    repeat: daily
-
-  - title: Have dinner
-    essential: true
-    at: "21:00"
-    repeat: daily
-
-  - title: Load the dishwasher
-    essential: true
-    at: "23:30"
-    repeat: daily
-
-  - title: Go to sleep
-    at: "00:00"
-    repeat: daily
-
-  - title: Laundry
-    at: "12:00"
-    repeat: weekly
-    day: friday
-
-  - title: Clean the floor
-    at: "12:00"
-    repeat: monthly
-
-  - title: Clean the bathroom
-    at: "12:00"
-    repeat: every 3 weeks
-
-  - title: Change the sheets
-    at: "12:00"
-    repeat: every 2 weeks
-    day: friday
+version: 2
+chores: []

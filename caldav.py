@@ -133,6 +133,36 @@ def build_vtodo(uid: str, summary: str, *, due: datetime | None = None,
     return "\r\n".join(out) + "\r\n"
 
 
+def parse_dt(value: str) -> datetime | None:
+    """An iCalendar date-time -> naive LOCAL datetime, or None.
+
+    Three forms reach this, and escalate.py used to accept only the first:
+
+        20260928T120000Z    UTC
+        20260928T120000     floating or TZID-qualified -- already local wall clock
+        20260928            VALUE=DATE, which iOS writes for an all-day due date
+
+    Lives here rather than in a caller because it is an iCalendar concern and two
+    copies would drift. Callers pass the part after the first colon, so any
+    parameters (TZID=, VALUE=) are already stripped.
+    """
+    value = (value or "").strip()
+    m = re.match(r"^(\d{8})(?:T(\d{6})(Z?))?$", value)
+    if not m:
+        return None
+    day, clock, zulu = m.group(1), m.group(2), m.group(3)
+    try:
+        stamp = datetime.strptime(day + (clock or "000000"), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    if zulu == "Z":
+        # astimezone() uses the offset in force AT THAT INSTANT. The previous
+        # version added (now() - utcnow()), i.e. today's offset, so a September
+        # timestamp read in January came out an hour wrong.
+        stamp = stamp.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
+    return stamp
+
+
 def parse_vtodo(text: str) -> dict:
     """Pull back what the brain acts on, plus what it needs to verify.
 

@@ -29,6 +29,33 @@ def load_config(path: Path = CONFIG_PATH) -> dict:
     return _cache[1]
 
 
+def local_now(cfg: dict | None = None) -> datetime:
+    """Naive local wall clock. The one answer to "what time is it here".
+
+    Every timestamp in the database is naive local (store.now_iso()), and
+    /etc/localtime is bind-mounted into every container, so container-local ==
+    host-local == phone-local. The `timezone` key in config.yaml was read by
+    nothing at all: if it ever diverged from the host, the day boundary and the
+    chore windows would silently use the host's instead. A bad or unresolvable
+    name falls back to system local rather than raising -- a typo in a config file
+    must not stop the worker loop.
+    """
+    cfg = cfg or load_config()
+    name = str(cfg.get("timezone") or "").strip()
+    if name:
+        try:
+            from zoneinfo import ZoneInfo
+            return datetime.now(ZoneInfo(name)).replace(tzinfo=None)
+        except Exception:
+            pass
+    return datetime.now()
+
+
+def local_today(cfg: dict | None = None) -> date:
+    """Today, by the configured timezone. The day boundary for chores."""
+    return local_now(cfg).date()
+
+
 def _parse_hm(s: str) -> int:
     """'18:00' -> minutes since midnight. '24:00' is end-of-day (1440)."""
     h, m = s.split(":")

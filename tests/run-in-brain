@@ -3,7 +3,7 @@
 set -u
 cd "$(dirname "$0")/.."
 rc=0
-for t in test_today_endpoint.py test_apply.py; do
+for t in test_today_endpoint.py test_apply.py test_upkeep_endpoints.py; do
   echo "== $t"
   podman cp "tests/$t" "brain:/tmp/$t"
   podman exec -e BRAIN_ROOT="/tmp/scratch-$t" brain sh -c \

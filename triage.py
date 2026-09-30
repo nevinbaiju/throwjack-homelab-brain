@@ -201,6 +201,21 @@ def _promote(conn) -> dict:
         return {"promoted": 0, "held": 0, "error": str(e)}
 
 
+def _sweep_upkeep(conn) -> dict:
+    """Archive yesterday's unfinished chore instances.
+
+    Strictly after reconcile, which is what the `reconciled` flag enforces: a
+    tick you made at 23:58 and the phone synced at 00:10 must be read BEFORE the
+    instance is taken away, or the completion is lost and last_done never moves.
+    """
+    import policy, upkeep
+    try:
+        return upkeep.sweep_expired(conn, policy.local_today(), reconciled=True)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[triage] upkeep sweep failed: {type(e).__name__}: {e}", flush=True)
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def _escalate(conn) -> dict:
     """Re-arm alarms. Guarded for the same reason _promote is.
 
@@ -270,6 +285,8 @@ def run(conn, limit: int = 25) -> dict:
     try:
         board.bootstrap()
         summary["reconciled"] = reconcile(conn)
+        # After reconcile, never before -- see _sweep_upkeep.
+        summary["upkeep_swept"] = _sweep_upkeep(conn)
         summary["from_siri"] = len(board.drain_inbox(conn))
         summary["ingested"] = ingest_inbox(conn)
         captures = [dict(r) for r in store.pending_captures(conn, limit)]

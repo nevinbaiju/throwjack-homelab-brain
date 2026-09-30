@@ -641,6 +641,21 @@ def set_state(conn, task_id: str, verb: str) -> bool:
             "UPDATE tasks SET lane=?, status=?, completed_at=?, touched_at=?, updated_at=? WHERE id=?",
             (lane, status, ts if status == "completed" else None, ts, ts, task_id))
 
+    # Keep the chore's last_done in step. This is the path the web board and a
+    # capture directive both take, so without it ticking a chore off anywhere but
+    # the phone would leave the cadence measuring from the wrong date.
+    if verb in ("done", "doing", "blocked"):
+        try:
+            import upkeep
+            fresh_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if fresh_row is not None:
+                if verb == "done":
+                    upkeep.note_completion(conn, fresh_row)
+                else:
+                    upkeep.note_reopened(conn, fresh_row)
+        except Exception as e:                               # noqa: BLE001
+            print(f"[state] upkeep state for {task_id}: {type(e).__name__}: {e}", flush=True)
+
     log_event(row["project"], f"**{verb}** `{task_id}` — {row['title']}")
 
     # Reflect it on the phone. write_task moves the item to the new lane and

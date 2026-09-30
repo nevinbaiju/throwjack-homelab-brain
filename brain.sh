@@ -19,7 +19,27 @@ case "${1:-board}" in
     curl -s -X POST "$URL/capture" -H "$AUTH" -H 'Content-Type: text/plain' \
          -H 'X-Source: cli' --data "$*"; echo ;;
   triage)  curl -s -X POST "$URL/triage" -H "$AUTH"; echo ;;
-  upkeep)  curl -s -X POST "$URL/upkeep/sync" -H "$AUTH"; echo ;;
+  upkeep)
+    # There is nothing to sync any more: the brain owns the cadence, so this
+    # shows where every chore stands instead of pushing VTODOs to a list.
+    curl -s "$URL/upcoming" -H "$AUTH" ;;
+  upkeep-done)
+    shift
+    slug="${1:?usage: ./brain.sh upkeep-done <slug> [YYYY-MM-DD]}"; shift || true
+    curl -s -X POST "$URL/upkeep/$slug/done" -H "$AUTH" \
+         -H 'Content-Type: application/json' \
+         --data "{\"on\":\"${1:-}\"}"; echo ;;
+  upkeep-retire)
+    # One-shot migration off the old iOS-owned Upkeep list. Dry by default: it
+    # prints the completion dates it would mine and the rows it would clean, and
+    # writes nothing. Pass --go to actually export, seed and delete.
+    shift
+    if [ "${1:-}" = "--go" ]; then
+      curl -s -X POST "$URL/upkeep/retire?dry=false" -H "$AUTH"; echo
+    else
+      echo "(dry run — pass --go to apply)" >&2
+      curl -s -X POST "$URL/upkeep/retire?dry=true" -H "$AUTH"; echo
+    fi ;;
   dump)
     # ./brain.sh dump doordash notes.md    (or: ... dump doordash  then type, ^D)
     shift
@@ -209,5 +229,5 @@ if not live: print('    (none — laptop offline or not paired)')" 2>/dev/null
       sleep 1
     done
     echo "did not come up in 30s — check: ./brain.sh logs" >&2; exit 1 ;;
-  *) echo "usage: ./brain.sh {rebuild|health|capture <text>|dump <proj> [file]|project <proj>|sync <proj>|upkeep|triage|board|upcoming|ui|setpass [user]|inbox|logs [container]|status|doctor|syncpass [user]|reset [all]}" >&2; exit 2 ;;
+  *) echo "usage: ./brain.sh {rebuild|health|capture <text>|dump <proj> [file]|project <proj>|sync <proj>|upkeep|upkeep-done <slug>|upkeep-retire|triage|board|upcoming|ui|setpass [user]|inbox|logs [container]|status|doctor|syncpass [user]|reset [all]}" >&2; exit 2 ;;
 esac

@@ -75,7 +75,7 @@ that failure as an SSL error. Check "Use Tailscale DNS" is on.
 
 ### 6. Prove alarms fire before building on them
 ```
-./brain.sh upkeep      # writes the recurring chores
+./brain.sh upkeep      # shows where every recurring chore stands
 ```
 Then set a chore a few minutes out and wait. If the phone does not buzz, the
 whole on-device alarm design is wrong for that setup and the user should know
@@ -83,10 +83,19 @@ before relying on it.
 
 ## Customising
 
-**Chores** — `upkeep.yaml`. `at`, `repeat` (daily / weekly / monthly /
-`every N weeks`), `day` for weekly ones, `essential: true` for the few that
-should chase the user when overdue. Spell it `day`, not `on`: YAML treats `on`
-as a boolean and the weekday silently vanishes. Re-run `./brain.sh upkeep`.
+**Chores** — the Upkeep tab, or `upkeep.yaml` by hand. `every` (`7d` / `2w` /
+`1m`), optional `window` (`weekend` / `weekday`) or `days: [sat, sun]`,
+`time_of_day`, `est_min`, and `essential: true` for the few that should chase the
+user when badly overdue.
+
+Due is `last_done + every` — the brain owns the recurrence, and a chore becomes a
+real task only for the day it is scheduled. A chore nobody schedules stays due and
+is offered again the next day; one with a `window` waits for its next window
+rather than nagging on a day it cannot be done.
+
+Spell the weekday list `days`, never `on`: YAML 1.1 reads `on` as a boolean and
+the weekday silently vanishes. There is no re-sync step — edits take effect on
+the next read.
 
 **Quiet hours and tracks** — `config.yaml`. `downtime` is absolute and beats
 every per-track window. Reminders coming due inside a closed window are held

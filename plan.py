@@ -27,11 +27,29 @@ import store
 # and you are back to a backlog with a different name.
 TODAY_CAP = int(os.environ.get("BRAIN_TODAY_CAP", "5"))
 
-# Chores are not tasks (AGENTS.md). iOS owns their recurrence and completion,
-# and the brain only ever reads them. They appear in the context so the model
-# can see the day is already half full, but no mutation may touch them.
-def _is_chore(row) -> bool:
-    return str(row["id"]).startswith("u_") or row["track"] == "upkeep"
+# A chore INSTANCE: one scheduled day of a recurring chore. It is a real task
+# and may be completed or pushed off the day, but its lane is owned by the
+# upkeep engine -- see the refusal in _resolve().
+#
+# This used to be `id.startswith("u_") or track == "upkeep"`, and the second
+# clause was doing real damage. The triage prompt classifies "cooking, dishes,
+# laundry, trash, groceries" as track='upkeep', so every ordinary capture of that
+# kind was silently unmutable AND filtered out of the planner's context entirely.
+# The track a task was filed under says nothing about whether the brain owns its
+# schedule; only source_key does.
+def _is_instance(row) -> bool:
+    return str(row["source_key"] or "").startswith("upkeep:")
+
+
+def _is_legacy_chore(row) -> bool:
+    """A u_* VTODO from the retired iOS-owned Upkeep list. None should remain."""
+    return str(row["id"]).startswith("u_")
+
+
+def _upkeep_slug(row) -> str | None:
+    import upkeep
+    parsed = upkeep.parse_source_key(row["source_key"])
+    return parsed[0] if parsed else None
 
 
 # Ops a DRAFT may propose. It may create tasks: planning a day routinely
@@ -42,7 +60,13 @@ def _is_chore(row) -> bool:
 # yesterday's carried items are actually finished, and refusing that forced
 # them BACK onto today -- the opposite of what was meant.
 OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append",
-       "add", "complete", "list_add"}
+       "add", "complete", "list_add", "schedule_chore"}
+
+# Chores get their own ceiling. They are 10-20 minute slotted jobs, so counting
+# them against TODAY_CAP would let three loads of washing crowd out the five
+# things the day is actually for -- but without any cap a day can quietly become
+# seven chores and nothing else.
+UPKEEP_CAP = int(os.environ.get("BRAIN_UPKEEP_CAP", "3"))
 
 # Ops an UPDATE may additionally propose. Mid-day reality is different:
 # things get finished and things fall off a day already in motion.
@@ -50,7 +74,7 @@ UPDATE_OPS = OPS | {"to_today", "from_today"}
 
 
 def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
-                  message: str = "") -> dict:
+                  message: str = "", today: date | None = None) -> dict:
     """What the model gets to look at. Deliberately small.
 
     Everything here is already on the board -- this adds no new source of
@@ -76,13 +100,45 @@ def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
             d["note"] = row["note"][:280]
         return d
 
+    import policy
+    today = today or policy.local_today()
+
     lanes: dict[str, list[dict]] = {}
     for lane in ("today", "in_progress", "backlog"):
         lanes[lane] = [slim(r) for r in store.active_tasks(conn, lane)
-                       if not _is_chore(r)]
+                       if not _is_legacy_chore(r) and not _is_instance(r)]
 
-    chores = [{"id": r["id"], "title": r["title"]}
-              for r in store.active_tasks(conn, "upkeep")]
+    # Chores due today, from the engine -- not from a lane. The old code read
+    # store.active_tasks(conn, "upkeep"), which only ever held escalation nudge
+    # cards, so the planner had never once seen Laundry or Change-the-sheets.
+    import upkeep
+    try:
+        states = upkeep.all_states(conn, today)
+    except Exception as e:                                   # noqa: BLE001
+        print(f"[plan] upkeep.all_states failed: {type(e).__name__}: {e}", flush=True)
+        states = []
+
+    def chore_brief(c: dict) -> dict:
+        d = {"slug": c["slug"], "title": c["title"], "every": c["every"]}
+        for key in ("time_of_day", "est_min"):
+            if c.get(key):
+                d[key] = c[key]
+        if c.get("overdue_days"):
+            d["overdue_days"] = c["overdue_days"]
+        if c.get("missed_windows"):
+            d["deferred_times"] = c["missed_windows"]
+        if c.get("last_done"):
+            d["last_done"] = c["last_done"]
+        if c.get("next_due"):
+            d["next_due"] = c["next_due"]
+        return d
+
+    due = [chore_brief(c) for c in states if c["state"] == upkeep.DUE
+           and not c.get("scheduled_today")]
+    waiting = [chore_brief(c) for c in states if c["state"] == upkeep.WAITING]
+    already = [{"slug": c["slug"], "title": c["title"],
+                "at": (c["scheduled_today"] or {}).get("at")}
+               for c in states if c.get("scheduled_today")]
 
     # Shopping lists live only in CalDAV; they are not rows in tasks. Unless
     # they are named here, "add paneer to the costco list" becomes a backlog
@@ -90,16 +146,33 @@ def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
     shops = _shopping_collections()
 
     ctx = {
-        "date": date.today().isoformat(),
+        "date": today.isoformat(),
+        "weekday": f"{today:%A}",
         "cap": TODAY_CAP,
+        "upkeep_cap": UPKEEP_CAP,
         "lanes": lanes,
-        "chores_today": chores,
         "shopping_lists": shops,
         "journal": journal[:2000],
     }
+    if due:
+        ctx["upkeep_due"] = due
+    if waiting:
+        ctx["upkeep_waiting"] = waiting
+    if already:
+        ctx["upkeep_already_scheduled"] = already
+
     # What he ticked before pressing the button. Not a hint -- a decision.
+    # Chores arrive prefixed, because they have no task_id and the prompt forbids
+    # inventing one; they need their own channel or the model has to guess.
     if selected:
-        ctx["selected_by_user"] = [t for t in selected][:50]
+        picks = [str(t) for t in selected][:50]
+        chore_picks = [t.split(":", 1)[1] for t in picks if t.startswith("upkeep:")]
+        task_picks = [t for t in picks if not t.startswith("upkeep:")]
+        if task_picks:
+            ctx["selected_by_user"] = task_picks
+        if chore_picks:
+            known = {c["slug"] for c in states}
+            ctx["selected_upkeep"] = [c for c in chore_picks if c in known]
     if message:
         ctx["user_says"] = message[:2000]
     return ctx
@@ -119,7 +192,9 @@ Reply with ONLY a JSON object, no prose, no code fence:
               {{"op":"retitle","task_id":"<id>","title":"<new title>"}},
               {{"op":"note_append","task_id":"<id>","text":"<one line>"}},
               {{"op":"list_add","list":"<key from shopping_lists>","items":["<item>",...]}},
-              {{"op":"complete","task_id":"<id>"}}],
+              {{"op":"complete","task_id":"<id>"}},
+              {{"op":"schedule_chore","slug":"<slug from upkeep_due>","at":"HH:MM",
+               "why":"<max 12 words>"}}],
  "notes": "<max 40 words: what you changed and why>"}}
 
 HOW TO READ THE INPUT. Three cases, and you are usually in the third:
@@ -139,7 +214,7 @@ HOW TO READ THE INPUT. Three cases, and you are usually in the third:
    also name extra things to include. Honour both. This is the common case:
    "these two are done" or "these two plus a Costco run".
 4. Neither present -> nothing has been decided, so this is your call: look at
-   the lanes and chores_today and propose a sensible day.
+   the lanes and upkeep_due and propose a sensible day.
 
 They know their day. Do not argue with it, do not substitute your own
 priorities, and never answer that something has no id.
@@ -147,9 +222,25 @@ priorities, and never answer that something has no id.
 - If they name something that is NOT already a task, CREATE it with
   {{"op":"add", ...}}. Use lane "today" if it is for today. You do not need an
   existing id, and "it has no id" is never a reason to leave the day empty.
-- Chores from chores_today CAN be today's items. Put their ids in "today"
-  like anything else -- a Sunday that is cooking and a Costco run is a real
-  day. You may not mutate them; referencing one is not mutating it.
+UPKEEP. "upkeep_due" lists recurring chores that are due, by slug. They are
+not tasks and have no task_id, so they can NEVER go in "today" and you must
+never invent an id for one. To put one on the day, emit
+{{"op":"schedule_chore","slug":"...","at":"HH:MM"}} and give it a real time
+slot. Rules:
+  - Schedule one only when they asked for it, or -- if they have not said what
+    the day is -- when it is genuinely due and the day has room.
+    Never more than {UPKEEP_CAP} chores in one day.
+  - "selected_upkeep" means they ticked those chores. Schedule every one.
+  - Use "time_of_day" as a hint and "est_min" for how long it takes. Slots must
+    be between 06:00 and 23:59. Do not stack two chores at the same time.
+  - Leaving a due chore alone is fine and costs nothing: it stays due and will
+    be offered again tomorrow. Do not schedule something just to clear it.
+  - "upkeep_waiting" chores are overdue but cannot be done today (a weekend-only
+    chore on a Tuesday). Do not schedule them and do not mention them unless
+    asked -- they come back on their own.
+  - "upkeep_already_scheduled" is on the day already. Leave it alone.
+  - A chore already scheduled today IS an ordinary today item with an id: you
+    may "complete" it or push it off with "from_today", nothing else.
 - Change ONLY what they asked for. If they gave you instructions, do not
   volunteer unrelated tidying of the board. A mutation they did not ask for
   is noise at best.
@@ -194,8 +285,11 @@ def _key_mutations(muts: list[dict]) -> None:
     """
     seen: dict[str, int] = {}
     for m in muts:
-        base = "{}:{}".format(m["op"],
-                              m.get("task_id") or m.get("title") or m.get("list") or "")
+        # `slug` matters: a schedule_chore carries no task_id, title or list, so
+        # without it every one keyed as "schedule_chore:" and fell back to
+        # POSITION -- reintroducing exactly the bug this function exists to stop.
+        base = "{}:{}".format(m["op"], m.get("task_id") or m.get("slug")
+                              or m.get("title") or m.get("list") or "")
         n = seen.get(base, 0)
         seen[base] = n + 1
         m["key"] = base if n == 0 else f"{base}#{n}"
@@ -233,17 +327,20 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
         seen.add(tid)
         today.append({"task_id": tid, "title": row["title"],
                       "why": str(item.get("why", ""))[:120],
-                      # A chore in today is a REFERENCE. iOS owns its
-                      # recurrence and completion, so apply() must not move it
-                      # out of the Upkeep list -- it just appears on the day.
-                      "is_chore": _is_chore(row)})
+                      # A scheduled chore instance IS today's work, so it counts
+                      # as picked like anything else. What differs is what
+                      # happens when it is NOT picked: apply() archives it rather
+                      # than filing it to prev_lane.
+                      "is_upkeep": _is_instance(row),
+                      "scheduled_at": row["scheduled_at"]})
     # Advisory, never truncating. Silently dropping the sixth thing you said
     # you were doing today is worse than an overfull list: you would not know
     # it had gone. The cap is guidance to the model in the prompt and a
     # warning to you here.
-    n_today = len(today) + sum(1 for m_ in (data.get("mutations") or [])
-                               if isinstance(m_, dict) and m_.get("op") == "add"
-                               and m_.get("lane") == "today")
+    n_today = len([t for t in today if not t["is_upkeep"]]) + sum(
+        1 for m_ in (data.get("mutations") or [])
+        if isinstance(m_, dict) and m_.get("op") == "add"
+        and m_.get("lane") == "today")
     if n_today > TODAY_CAP:
         rejected.append(f"today holds {n_today} items, over the cap of {TODAY_CAP}")
 
@@ -257,6 +354,24 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
             rejected.append(why or "rejected")
         else:
             muts.append(clean)
+
+    # One schedule per chore. A duplicate is the model repeating itself, and two
+    # rows for one slug would race in materialise().
+    seen_slugs: set[str] = set()
+    kept: list[dict] = []
+    for m_ in muts:
+        if m_["op"] == "schedule_chore":
+            if m_["slug"] in seen_slugs:
+                rejected.append(f"dropped a second schedule for {m_['slug']}")
+                continue
+            seen_slugs.add(m_["slug"])
+        kept.append(m_)
+    muts = kept
+
+    scheduled = len(seen_slugs) + len([t for t in today if t["is_upkeep"]])
+    if scheduled > UPKEEP_CAP:
+        rejected.append(f"{scheduled} chores scheduled, over the upkeep cap "
+                        f"of {UPKEEP_CAP}")
 
     _key_mutations(muts)
     return ({"today": today, "mutations": muts,
@@ -307,17 +422,26 @@ def apply(conn, proposal: dict) -> dict:
     Nothing is deleted. Tasks leaving today go back to prev_lane, which was
     recorded on the way in -- that is the whole reason the column exists.
     """
+    import policy
+    import upkeep
     now = store.now_iso()
-    # Chores are referenced, never moved: iOS owns the Upkeep list and its
-    # recurrence. They show on the day; their lane is not ours to change.
-    picked = {i["task_id"] for i in proposal.get("today", [])
-              if not i.get("is_chore")}
-    moved_in = moved_out = 0
+    today_date = policy.local_today()
+
+    # A LIST, not a set. `picked` used to be a set and the move-in loop iterated
+    # it, so the order tasks entered today depended on PYTHONHASHSEED -- which is
+    # random per process. The model's ordering is a judgement about the day and
+    # has to survive.
+    order = [i["task_id"] for i in proposal.get("today", [])]
+    picked = set(order)
+    moved_in = moved_out = swept = 0
     # Completions run first: if you ticked a carried item to say it is
     # finished, it must leave the day rather than be re-selected into it.
+    completing: set[str] = set()
     for m_ in proposal.get("mutations", []):
         if m_["op"] == "complete":
             picked.discard(m_.get("task_id"))
+            order = [t for t in order if t != m_.get("task_id")]
+            completing.add(m_.get("task_id"))
     # A lane move changes which bucket the task occupies in its project's
     # STATE.md, so selection alone is enough to make that folder stale.
     slugs: set[str] = set()
@@ -325,6 +449,22 @@ def apply(conn, proposal: dict) -> dict:
 
     for row in store.active_tasks(conn, "today"):
         if row["id"] in picked:
+            continue
+        if row["id"] in completing:
+            # About to be completed below. The sweep must not touch it first: for
+            # a chore instance, archiving it here makes project.set_state's
+            # "WHERE archived=0" miss, so the completion is silently dropped and
+            # last_done never moves -- the chore then asks again tomorrow for
+            # something you just told it you had done.
+            continue
+        if _is_instance(row):
+            # An unpicked chore instance is ARCHIVED, never sent to prev_lane.
+            # prev_lane is NULL for an instance (it was born in today), so the
+            # restore would dump the chore into Backlog as a task with no visible
+            # connection to its cadence -- and the chore itself would stay due,
+            # so you would accumulate one orphan per skipped day.
+            upkeep.archive_instance(conn, row, "not picked for today")
+            swept += 1
             continue
         back = row["prev_lane"] or "backlog"
         conn.execute(
@@ -335,9 +475,15 @@ def apply(conn, proposal: dict) -> dict:
             slugs.add(row["project"])
             events.append((row["project"], f"**off today** `{row['id']}` — {row['title']}"))
 
-    for tid in picked:
+    for seq, tid in enumerate(order):
         row = conn.execute("SELECT lane, title, project FROM tasks WHERE id=?", (tid,)).fetchone()
-        if row is None or row["lane"] == "today":
+        if row is None:
+            continue
+        # today_seq, not seq: project.dump writes `seq` as within-project ordering
+        # and project.promote orders its candidates by it, so a global 0..N here
+        # would quietly change which task gets promoted next.
+        conn.execute("UPDATE tasks SET today_seq=? WHERE id=?", (seq, tid))
+        if row["lane"] == "today":
             continue
         conn.execute(
             "UPDATE tasks SET lane='today', prev_lane=?, updated_at=?, touched_at=? WHERE id=?",
@@ -362,6 +508,22 @@ def apply(conn, proposal: dict) -> dict:
                 except Exception as e:                       # noqa: BLE001
                     print(f"[plan] list_add {m_['list']}/{item}: {e}", flush=True)
             applied += 1
+            continue
+        if op == "schedule_chore":
+            # Must stay after the sweep above. Create the instance first and it is
+            # not in `picked`, so the sweep archives it the instant it is born.
+            #
+            # The date comes from now, not from validate() -- a draft written at
+            # 23:58 and accepted at 00:05 belongs to the new day.
+            chore = upkeep.by_slug(m_["slug"])
+            if chore is None:
+                continue                      # deleted from the yaml since drafting
+            try:
+                upkeep.materialise(conn, chore, m_["at"], day=today_date,
+                                   why=m_.get("why") or "", today_seq=-1)
+                applied += 1
+            except upkeep.ChoreError as e:
+                print(f"[plan] schedule_chore {m_['slug']}: {e}", flush=True)
             continue
         if op == "add":
             new_id = store.create_task(conn, title=m_["title"], note=m_.get("note", ""),
@@ -408,8 +570,8 @@ def apply(conn, proposal: dict) -> dict:
                 events.append((slug, f"**{op}** `{tid}`"))
 
     synced = _sync_projects(conn, slugs, events)
-    return {"today": len(picked), "moved_in": moved_in,
-            "moved_out": moved_out, "mutations": applied, "projects": synced}
+    return {"today": len(picked), "moved_in": moved_in, "moved_out": moved_out,
+            "upkeep_archived": swept, "mutations": applied, "projects": synced}
 
 
 # --------------------------------------------------------------- job queue ---
@@ -634,12 +796,46 @@ def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
         return {"op": "add", "title": title, "lane": lane, "consequence": cq,
                 "note": str(m.get("note", ""))[:500]}, None
 
+    if op == "schedule_chore":
+        import upkeep
+        slug = str(m.get("slug", "")).strip()
+        chore = upkeep.by_slug(slug)
+        if chore is None:
+            known = ", ".join(c["slug"] for c in upkeep.load()) or "none"
+            return None, f"no chore {slug!r} (have: {known})"
+        try:
+            at = upkeep.validate_slot(m.get("at"))
+        except upkeep.ChoreError as e:
+            return None, f"{slug}: {e}"
+        # Deliberately NOT gated on the chore being Due. _resolve cannot tell
+        # "the model invented this" from "he asked for it", and the user always
+        # wins. The computed state rides along so the review screen can say
+        # "not due until Oct 17" next to the checkbox instead of refusing.
+        import policy
+        today = policy.local_today()
+        row_state = next((c for c in upkeep.all_states(conn, today)
+                          if c["slug"] == slug), None)
+        return {"op": op, "slug": slug, "at": at,
+                "title": chore["title"], "est_min": chore.get("est_min"),
+                "state": (row_state or {}).get("state"),
+                "next_due": (row_state or {}).get("next_due"),
+                "overdue_days": (row_state or {}).get("overdue_days", 0),
+                "why": str(m.get("why", "")).strip()[:120]}, None
+
     tid = str(m.get("task_id", ""))
     row = rows.get(tid)
     if row is None:
         return None, f"mutation on unknown task {tid!r}"
-    if _is_chore(row):
-        return None, f"refused mutation on chore {tid}"
+    if _is_legacy_chore(row):
+        return None, f"refused mutation on retired iOS chore {tid}"
+    if _is_instance(row) and op not in ("complete", "from_today"):
+        # A scheduled chore may be ticked off or pushed off the day, and nothing
+        # else. set_lane in particular must stay refused: prev_lane is NULL on a
+        # fresh instance, so the sweep would file the chore into Backlog, where it
+        # would sit forever as a task nobody can see is a chore.
+        return None, (f"refused {op} on scheduled chore "
+                      f"{_upkeep_slug(row) or tid} -- change its cadence in "
+                      f"upkeep.yaml, or complete it, or push it off today")
 
     if op == "set_lane":
         lane = str(m.get("lane", ""))
@@ -773,8 +969,16 @@ def apply_update(conn, proposal: dict) -> dict:
                 done.append(f"pulled “{m.get('title', tid)}” into today")
 
         elif op == "from_today":
-            row = conn.execute("SELECT lane, prev_lane FROM tasks WHERE id=?", (tid,)).fetchone()
-            if row and row["lane"] == "today":
+            row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+            if row and _is_instance(row):
+                # "Not today" for a chore is the same outcome as the overnight
+                # sweep: the instance goes, the chore stays due and keeps asking.
+                # One behaviour, not two.
+                import upkeep
+                upkeep.archive_instance(conn, row, "pushed off today")
+                done.append(f"dropped “{m.get('title', tid)}” from today; "
+                            f"the chore is still due")
+            elif row and row["lane"] == "today":
                 conn.execute(
                     "UPDATE tasks SET lane=?, prev_lane=NULL, updated_at=?, touched_at=?"
                     " WHERE id=?", (row["prev_lane"] or "backlog", now, now, tid))

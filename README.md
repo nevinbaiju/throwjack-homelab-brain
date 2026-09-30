@@ -23,7 +23,7 @@ self-hosted CalDAV, with alarms that fire **on the device** — no push service,
 works offline, mirrors to your Watch.
 
 **It notices what you dropped.** A missed reminder re-arms on a growing backoff.
-An essential chore that goes badly overdue raises its own nudge. Both stop after
+An essential chore that goes badly overdue is put on today for you. Both stop after
 four attempts, because endless nagging just teaches you to swipe.
 
 ## Why it looks like this
@@ -38,7 +38,7 @@ with real use:
   never gets done — and deadline, age, blocking and effort do the rest. Priority
   fields rot; `P1` inflates until everything is `P1`.
 - **Escalation adds precision, not volume.** "Have breakfast — due 9h ago"
-  becomes "…has been waiting 20h. Do it, or drop it from upkeep.yaml."
+  becomes "…has been waiting 20h." A chore is instead scheduled into today.
 - **Nothing is deleted, only archived.** This has already saved the project once.
 - **You always win.** Move, rename or tick anything on your phone and the
   database follows you. Delete a reminder and it dismisses the nudge — it does
@@ -69,7 +69,7 @@ By hand:
     # fill both in — LITELLM_MASTER_KEY must match across them
     podman compose up -d --build
     ./brain.sh setpass          # browser login
-    ./brain.sh upkeep           # write your recurring chores
+    ./brain.sh upkeep           # where every recurring chore stands
 
 Free LLM keys: <https://freellm.net>. Groq and Google AI Studio are the
 highest-value pair; neither needs a card.
@@ -87,7 +87,8 @@ for a project's worth of thinking.
 
 ## Customising
 
-- `upkeep.yaml` — your recurring chores, their cadence, and which ones are
+- `upkeep.yaml` — your recurring chores and their cadence. Due is counted from
+  when you last did one (`last_done + every`), never a fixed weekday; and
   essential enough to chase you.
 - `config.yaml` — quiet hours, per-track windows, how long things sit before
   they start climbing.

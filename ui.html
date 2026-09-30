@@ -81,6 +81,8 @@
   #today .pick .t{font-weight:600}
   #today .pick .why{opacity:.72;font-size:.9em;margin-top:2px}
   #today .mut{font-size:.85em;margin-top:4px;opacity:.85}
+  #today .slot{font-family:var(--mono);font-size:.82em;padding:1px 5px;margin-right:2px;
+    background:var(--raise);border:1px solid var(--rule);border-radius:4px;color:var(--ink-2)}
   #today .mut b{font-weight:600}
   #today .notpicked{opacity:.6;font-size:.9em;margin:14px 4px}
   #today textarea{width:100%;min-height:76px;margin-top:14px}
@@ -140,7 +142,17 @@
   .cadedit{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;align-items:center}
   .cadedit input,.cadedit select{font-family:var(--mono);font-size:12px;padding:5px 7px;
     background:var(--surface);color:var(--ink);border:1px solid var(--rule);border-radius:6px}
-  .cadedit input.rep{flex:1;min-width:120px}
+  .cadedit input.rep,.cadedit input.title{flex:1;min-width:120px}
+  .cadedit input.every{width:64px}
+  .cadedit input.est{width:70px}
+  .cadedit.acts{margin-top:8px}
+  .cadedit label{font-family:var(--mono);font-size:11px;color:var(--ink-3);
+    display:inline-flex;gap:3px;align-items:center}
+  .daysel{display:inline-flex;gap:5px;flex-wrap:wrap}
+  /* A chore that is due should read as due without having to parse the line. */
+  .task.st-due .cad:first-of-type{color:var(--ink)}
+  .task.st-waiting .cad:first-of-type,.task.st-snoozed .cad:first-of-type{opacity:.7}
+  .task.st-broken .cad:first-of-type{color:var(--signal)}
   .cadedit .save{background:var(--accent);color:var(--accent-ink);border:0;cursor:pointer;
     font-family:var(--cond);font-weight:700;font-size:11px;letter-spacing:.06em;
     text-transform:uppercase;padding:6px 12px;border-radius:6px}
@@ -267,25 +279,69 @@ async function act(id, verb, li){
   }
 }
 
-function cadenceText(c){
-  if (!c) return 'added on the phone — cadence lives in Reminders';
-  return c.repeat + (c.at ? ' at ' + c.at : '') + (c.day ? ' · ' + c.day : '');
+const DAYS = ['mon','tue','wed','thu','fri','sat','sun'];
+const TIMES = ['','morning','midday','afternoon','evening','night'];
+const SLOT_FOR = {morning:'10:00', midday:'12:00', afternoon:'15:00',
+                  evening:'19:00', night:'21:00'};
+
+function shortDate(iso){
+  if (!iso) return '';
+  const d = new Date(iso + 'T12:00:00');
+  return isNaN(d) ? iso : d.toLocaleDateString(undefined, {day:'numeric', month:'short'});
 }
 
-const DAYS = ['','monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+// What this chore's cadence says, in words.
+function cadenceText(c){
+  const bits = ['every ' + c.every];
+  if (c.days && c.days.length) bits.push(c.days.join('/'));
+  else if (c.window) bits.push(c.window + 's only');
+  if (c.time_of_day) bits.push(c.time_of_day);
+  if (c.est_min) bits.push('~' + c.est_min + 'm');
+  if (c.essential) bits.push('essential');
+  return bits.join(' · ');
+}
 
-async function saveCadence(uid, li){
-  const repeat = li.querySelector('.rep').value.trim();
-  const at = li.querySelector('.at').value.trim();
-  const day = li.querySelector('.day').value;
-  if (!repeat) return say('repeat cannot be empty', true);
+// Where this chore stands today. Pure, so tests can cover it without a DOM.
+function stateLine(c){
+  if (c.state === 'broken') return 'BROKEN — ' + (c.error || 'unreadable');
+  const last = c.last_done ? 'last done ' + shortDate(c.last_done) : 'never done';
+  if (c.scheduled_today){
+    const at = (c.scheduled_today.at || '').slice(11,16);
+    const done = c.scheduled_today.status === 'completed';
+    return (done ? 'done today' : 'on today at ' + at) + ' · ' + last;
+  }
+  if (c.state === 'snoozed') return 'snoozed until ' + shortDate(c.snooze_until) + ' · ' + last;
+  if (c.state === 'not_due') return 'next ' + shortDate(c.next_due) + ' · ' + last;
+  if (c.state === 'waiting'){
+    return 'overdue ' + c.overdue_days + 'd, waiting for its window — next '
+           + shortDate(c.next_due) + ' · ' + last;
+  }
+  let t = c.overdue_days ? 'due, ' + c.overdue_days + 'd over' : 'due today';
+  if (c.missed_windows) t += ', deferred ' + c.missed_windows + 'x';
+  return t + ' · ' + last;
+}
+
+function choreFields(box){
+  const val = k => { const el = box.querySelector('.' + k); return el ? el.value.trim() : ''; };
+  const days = [...box.querySelectorAll('.daybox:checked')].map(b => b.value);
+  const body = {every: val('every'), time_of_day: val('tod'),
+                est_min: val('est') ? parseInt(val('est'), 10) : null,
+                essential: !!box.querySelector('.ess:checked')};
+  // window and days are alternatives, and the server clears whichever is absent.
+  if (days.length){ body.days = days; body.window = ''; }
+  else { body.days = []; body.window = val('win'); }
+  return body;
+}
+
+async function chorePost(url, body, okMsg){
   try{
-    const r = await fetch('/upkeep/' + encodeURIComponent(uid) + '/cadence',
-      {method:'POST', headers:{...H,'Content-Type':'application/json'},
-       body: JSON.stringify({repeat, at, day})});
+    const r = await fetch(url, {method: body === null ? 'DELETE' : 'POST',
+      headers:{...H,'Content-Type':'application/json'},
+      body: body === null ? undefined : JSON.stringify(body)});
     if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.detail || r.status); }
-    say('cadence updated'); loadLists('upkeep');
-  }catch(e){ say('could not update — ' + e.message, true); }
+    say(okMsg); loadLists('upkeep');
+    return true;
+  }catch(e){ say(e.message, true); return false; }
 }
 
 // Optimistic list edits. The DOM changes first and the request follows; a
@@ -362,25 +418,68 @@ function renderLists(which, data){
   const out = [];
   if (which === 'upkeep'){
     const items = data.upkeep || [];
-    out.push('<section class="lane"><h2>Upkeep<span class="n">' + items.length + '</span></h2><ul>');
-    if (!items.length) out.push('<li class="empty">nothing due</li>');
-    for (const i of items){
-      const c = i.cadence;
-      out.push('<li class="task" data-uid="' + esc(i.uid) + '">' +
-        '<div class="body"><div class="t">' + esc(i.summary) + '</div>' +
-        '<div class="cad">' + esc(cadenceText(c)) +
-          (c ? '<button data-edit="1">edit</button>' : '') + '</div>' +
-        (c ? '<div class="cadedit" hidden>' +
-              '<input class="rep" value="' + esc(c.repeat) + '" aria-label="repeat" ' +
-                'placeholder="daily · weekly · monthly · every 2 weeks">' +
-              '<input class="at" type="time" value="' + esc(c.at) + '" aria-label="time">' +
-              '<select class="day" aria-label="weekday">' +
-                DAYS.map(d => '<option value="' + d + '"' + (d === c.day ? ' selected' : '') + '>' +
-                              (d || 'any day') + '</option>').join('') +
-              '</select><button class="save">Save</button></div>' : '') +
-        '</div></li>');
+    const errs = data.upkeep_errors || [];
+    const due = items.filter(c => c.state === 'due' && !c.scheduled_today).length;
+    out.push('<section class="lane"><h2>Upkeep<span class="n">' + due + '</span></h2><ul>');
+    if (errs.length){
+      out.push('<li class="task"><div class="body"><div class="t">Problems in upkeep.yaml</div>' +
+        errs.map(e => '<div class="cad">' + esc(e) + '</div>').join('') + '</div></li>');
     }
-    out.push('</ul><p class="empty">tick these off in Reminders — iOS owns the recurrence</p></section>');
+    if (!items.length) out.push('<li class="empty">no chores yet — add one below</li>');
+    for (const c of items){
+      const slot = SLOT_FOR[c.time_of_day] || '18:00';
+      const days = c.days || [];
+      out.push('<li class="task st-' + esc(c.state) + '" data-slug="' + esc(c.slug) + '">' +
+        '<div class="body"><div class="t">' + esc(c.title) + '</div>' +
+        '<div class="cad">' + esc(stateLine(c)) + '</div>' +
+        '<div class="cad">' + esc(cadenceText(c)) +
+          '<button data-edit="1">edit</button></div>' +
+        '<div class="cadedit acts">' +
+          (c.scheduled_today ? '' :
+            '<input class="at" type="time" value="' + esc(slot) + '" aria-label="time for ' + esc(c.title) + '">' +
+            '<button class="sched">Add to today</button>') +
+          '<button class="did">Did it</button>' +
+          '<button class="snz">Snooze</button>' +
+        '</div>' +
+        '<div class="cadedit" hidden>' +
+          '<input class="every" value="' + esc(c.every) + '" aria-label="cadence" placeholder="7d · 2w · 1m">' +
+          '<select class="win" aria-label="window">' +
+            ['','weekend','weekday'].map(w => '<option value="' + w + '"' +
+              (w === (days.length ? '' : (c.window || '')) ? ' selected' : '') + '>' +
+              (w ? w + 's only' : 'any day') + '</option>').join('') +
+          '</select>' +
+          '<span class="daysel">' + DAYS.map(d =>
+            '<label><input class="daybox" type="checkbox" value="' + d + '"' +
+            (days.includes(d) ? ' checked' : '') + '>' + d + '</label>').join('') + '</span>' +
+          '<select class="tod" aria-label="time of day">' +
+            TIMES.map(t => '<option value="' + t + '"' +
+              (t === (c.time_of_day || '') ? ' selected' : '') + '>' +
+              (t || 'any time') + '</option>').join('') +
+          '</select>' +
+          '<input class="est" type="number" min="1" max="600" value="' +
+            esc(c.est_min == null ? '' : c.est_min) + '" aria-label="minutes" placeholder="mins">' +
+          '<label><input class="ess" type="checkbox"' + (c.essential ? ' checked' : '') +
+            '> essential</label>' +
+          '<button class="save">Save</button>' +
+          '<button class="kill" title="stop tracking this chore">×</button>' +
+        '</div></div></li>');
+    }
+    out.push('</ul>' +
+      '<form id="newchore"><div class="cadedit">' +
+        '<input class="title" placeholder="Change the sheets" aria-label="chore name">' +
+        '<input class="every" placeholder="14d" aria-label="cadence">' +
+        '<select class="win" aria-label="window">' +
+          ['','weekend','weekday'].map(w => '<option value="' + w + '">' +
+            (w ? w + 's only' : 'any day') + '</option>').join('') + '</select>' +
+        '<select class="tod" aria-label="time of day">' +
+          TIMES.map(t => '<option value="' + t + '">' + (t || 'any time') + '</option>').join('') +
+        '</select>' +
+        '<input class="est" type="number" min="1" max="600" placeholder="mins" aria-label="minutes">' +
+        '<label><input class="ess" type="checkbox"> essential</label>' +
+        '<button class="save" type="submit">Add chore</button>' +
+      '</div></form>' +
+      '<p class="empty">Due is counted from when you last did it, not from a calendar slot.</p>' +
+      '</section>');
   } else {
     for (const shop of data.shopping || []){
       out.push('<section class="lane" data-coll="' + esc(shop.collection) + '"><h2>' + esc(shop.label) +
@@ -410,14 +509,48 @@ function renderLists(which, data){
     if (lane && lane.dataset.coll) wireTick(li, lane.dataset.coll);
   });
 
-  // cadence edit toggles and saves
+  // The edit toggle opens the LAST .cadedit in the row (the editor); the first
+  // is the always-visible action row.
   $('lists').querySelectorAll('[data-edit]').forEach(b => {
-    b.onclick = () => { const box = b.closest('.body').querySelector('.cadedit'); box.hidden = !box.hidden; };
+    b.onclick = () => {
+      const boxes = b.closest('.body').querySelectorAll('.cadedit');
+      const box = boxes[boxes.length - 1];
+      if (box) box.hidden = !box.hidden;
+    };
   });
-  $('lists').querySelectorAll('.cadedit .save').forEach(b => {
-    const li = b.closest('.task');
-    if (li) b.onclick = () => saveCadence(li.dataset.uid, li);
+
+  $('lists').querySelectorAll('.task[data-slug]').forEach(li => {
+    const slug = li.dataset.slug, url = '/upkeep/' + encodeURIComponent(slug);
+    const on = (sel, fn) => { const b = li.querySelector(sel); if (b) b.onclick = fn; };
+    on('.sched', () => {
+      const at = li.querySelector('.at');
+      chorePost(url + '/schedule', {at: at ? at.value : ''}, 'added to today');
+    });
+    on('.did', () => chorePost(url + '/done', {}, 'logged — the clock restarts today'));
+    on('.snz', () => {
+      const days = prompt('Snooze ' + slug + ' for how many days?', '3');
+      if (days) chorePost(url + '/snooze', {days: parseInt(days, 10)}, 'snoozed');
+    });
+    on('.save', () => {
+      const box = li.querySelectorAll('.cadedit');
+      chorePost(url + '/cadence', choreFields(box[box.length - 1]), 'cadence updated');
+    });
+    on('.kill', () => {
+      if (confirm('Stop tracking “' + slug + '”? Its history is kept.'))
+        chorePost(url, null, 'no longer tracked');
+    });
   });
+
+  const nc = $('lists').querySelector('#newchore');
+  if (nc) nc.onsubmit = ev => {
+    ev.preventDefault();
+    const box = nc.querySelector('.cadedit');
+    const title = box.querySelector('.title').value.trim();
+    if (!title) return say('a chore needs a name', true);
+    if (!box.querySelector('.every').value.trim())
+      return say('how often? e.g. 7d, 2w, 1m', true);
+    chorePost('/upkeep', {title, ...choreFields(box)}, 'chore added');
+  };
 
   // add an item, from inside the list it belongs to
   $('lists').querySelectorAll('form.addrow').forEach(f => {
@@ -691,7 +824,9 @@ async function renderToday(warnIn){
 
   if (screen === 'current'){
     todayShell(warn + '<h2>Today</h2>' +
-      d.today.map(t => '<div class="pick"><div><div class="t">' + esc(t.title) + '</div>' +
+      d.today.map(t => '<div class="pick"><div><div class="t">' +
+        (t.at ? '<span class="slot">' + esc(t.at) + '</span> ' : '') + esc(t.title) + '</div>' +
+        (t.is_upkeep ? '<div class="why">upkeep</div>' : '') +
         (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
         '</div></div>').join('') +
       '<textarea id="say" placeholder="what happened?"></textarea>' +
@@ -711,18 +846,45 @@ async function renderToday(warnIn){
   let out = warn + '<h2>Plan today</h2>';
   if (d.planned_on)
     out += '<div class="notpicked">Last planned ' + esc(d.planned_on) + '.</div>';
+  // Upkeep leads. These are the things that come round again whether or not you
+  // think about them, and the point of surfacing them first is that deciding NOT
+  // to do one is a decision -- it stays due and comes back tomorrow.
+  const chores = d.upkeep_due || [];
+  if (chores.length){
+    out += '<div class="notpicked"><b>Upkeep</b> — due now</div>';
+    for (const c of chores){
+      const bits = [];
+      if (c.overdue_days) bits.push(c.overdue_days + 'd over');
+      if (c.missed_windows) bits.push('deferred ' + c.missed_windows + 'x');
+      bits.push(c.last_done ? 'last done ' + shortDate(c.last_done) : 'never done');
+      if (c.est_min) bits.push('~' + c.est_min + 'm');
+      out += '<label class="pick"><input type="checkbox" value="upkeep:' + esc(c.slug) + '">' +
+             '<div><div class="t">' + esc(c.title) + '</div>' +
+             '<div class="why">' + esc(bits.join(' · ')) + '</div></div></label>';
+    }
+  }
+  for (const c of (d.upkeep_waiting || [])){
+    out += '<div class="notpicked">' + esc(c.title) + ' is ' + c.overdue_days +
+           'd overdue but cannot be done today — next ' + esc(shortDate(c.next_due)) +
+           '</div>';
+  }
+
   const rows = [];
   if (d.today.length) rows.push(['Carried over', d.today]);
   const doing = d.pool.filter(t => t.lane === 'in_progress');
   const back  = d.pool.filter(t => t.lane === 'backlog');
   if (doing.length) rows.push(['In progress', doing]);
   if (back.length)  rows.push(['Backlog', back]);
-  if (!rows.length) out += '<p class="empty">Nothing in progress or backlog.</p>';
+  if (!rows.length && !chores.length)
+    out += '<p class="empty">Nothing in progress or backlog.</p>';
   for (const [label, items] of rows){
     out += '<div class="notpicked"><b>' + esc(label) + '</b></div>';
     for (const t of items){
       out += '<label class="pick"><input type="checkbox" value="' + esc(t.id) + '">' +
              '<div><div class="t">' + esc(t.title) + '</div>' +
+             (t.is_upkeep ? '<div class="why">upkeep' +
+                (t.at ? ' at ' + esc(t.at) : '') + ' — untick and it goes, and the ' +
+                'chore stays due</div>' : '') +
              (t.carried_from ? '<div class="why">carried from ' + esc(t.carried_from) + '</div>' : '') +
              (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
              '</div></label>';
@@ -802,6 +964,25 @@ function mutLine(m){
     return '<div class="mut">🛒 <b>' + esc(m.label) + '</b> — ' + esc((m.items||[]).join(', ')) + '</div>';
   if (m.op === 'complete')
     return '<div class="mut">✓ <b>done</b> — ' + esc(m.title || m.task_id) + '</div>';
+  if (m.op === 'schedule_chore')
+    return '<div class="mut">🧺 <b>' + esc(m.title || m.slug) + '</b> at ' + esc(m.at) +
+           esc(choreNote(m)) + '</div>';
+  // NEVER return '' here. renderDraft still emits a pre-ticked checkbox around
+  // whatever comes back, so an unrecognised op used to render as a blank,
+  // invisible, already-accepted row -- a change applied with nothing on screen
+  // to say what it was.
+  return '<div class="mut">? <b>' + esc(m.op) + '</b> — ' +
+         esc(m.title || m.slug || m.task_id || '') + '</div>';
+}
+
+// Why a chore is being put on the day, or the warning that it is not actually
+// due. The state rides along on the mutation precisely so this can be said.
+function choreNote(m){
+  if (m.state === 'waiting')
+    return ' — not due today; next ' + (m.next_due || '?');
+  if (m.state === 'not_due')
+    return ' — not due until ' + (m.next_due || '?');
+  if (m.overdue_days) return ' — ' + m.overdue_days + 'd over';
   return '';
 }
 
@@ -811,8 +992,10 @@ function renderDraft(warn){
   const byTask = {};
   for (const m of muts) (byTask[m.task_id] = byTask[m.task_id] || []).push(m);
 
-  // Tasks it is CREATING for today are part of the day, not a footnote.
-  const newToday = muts.filter(m => m.op === 'add' && m.lane === 'today');
+  // Things it is ADDING to the day -- a new task, or a chore being scheduled --
+  // are part of the day, not a footnote in "Also changes".
+  const newToday = muts.filter(m =>
+    (m.op === 'add' && m.lane === 'today') || m.op === 'schedule_chore');
 
   let out = (warn || '') + '<h2>Today</h2>';
   if (JOB.created_at){
@@ -830,13 +1013,19 @@ function renderDraft(warn){
   // new tasks rendered right here as part of the day: accepting the day would
   // silently bin the things you had just asked for.
   for (const m of newToday){
+    const chore = m.op === 'schedule_chore';
     out += '<label class="pick"><input type="checkbox" checked value="' + esc(m.key) + '">' +
-           '<div><div class="t">' + esc(m.title) + '</div>' +
-           '<div class="why">new task</div></div></label>';
+           '<div><div class="t">' +
+           (chore ? '<span class="slot">' + esc(m.at) + '</span> ' : '') +
+           esc(m.title) + '</div>' +
+           '<div class="why">' + (chore ? 'upkeep' + esc(choreNote(m)) : 'new task') +
+           '</div></div></label>';
   }
   for (const i of p.today){
     out += '<label class="pick"><input type="checkbox" checked value="' + esc(i.task_id) + '">' +
-           '<div><div class="t">' + esc(i.title) + '</div>' +
+           '<div><div class="t">' +
+           (i.scheduled_at ? '<span class="slot">' + esc(i.scheduled_at.slice(11,16)) + '</span> ' : '') +
+           esc(i.title) + '</div>' +
            '<div class="why">' + esc(i.why) + '</div>' +
            (byTask[i.task_id] || []).map(mutLine).join('') +
            '</div></label>';
@@ -845,7 +1034,7 @@ function renderDraft(warn){
   // Changes to tasks that are not on today's list still alter the board, so
   // they get their own tickable rows rather than being buried in prose.
   const other = muts.filter(m =>
-    !(m.op === 'add' && m.lane === 'today') &&
+    !newToday.includes(m) &&
     !p.today.some(i => i.task_id === m.task_id));
   if (other.length){
     out += '<div class="notpicked"><b>Also changes</b></div>';
@@ -949,7 +1138,9 @@ function updLine(m){
   if (m.op === 'set_lane')    return '→ ' + esc(m.lane) + ' — ' + esc(m.title || m.task_id);
   if (m.op === 'note_append') return '＋ note — ' + esc(m.text);
   if (m.op === 'list_add')    return '🛒 ' + esc(m.label) + ' — ' + esc((m.items||[]).join(', '));
-  return esc(m.op);
+  if (m.op === 'schedule_chore')
+    return '🧺 ' + esc(m.title || m.slug) + ' at ' + esc(m.at) + esc(choreNote(m));
+  return esc(m.op) + ' — ' + esc(m.title || m.slug || m.task_id || '');
 }
 
 function renderUpdate(warn){
