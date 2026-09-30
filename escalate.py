@@ -20,7 +20,7 @@ which costs you every future alert too.
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import board
 import caldav
@@ -39,13 +39,28 @@ OTHER_GRACE = timedelta(days=2)
 
 
 def _parse_ics_dt(value: str) -> datetime | None:
+    """-> naive local datetime, or None. Accepts the three forms iOS emits.
+
+        20260928T120000Z    UTC
+        20260928T120000     floating or TZID-qualified -- already local wall clock
+        20260928            VALUE=DATE, which iOS uses for an all-day due date
+
+    Only the first was accepted before, so every all-day DUE read as "no due
+    date at all". And the UTC conversion was wrong: adding (now() - utcnow())
+    applies TODAY's offset, so a September timestamp read in January came out an
+    hour off. astimezone() uses the offset in force at that instant instead.
+    """
     value = (value or "").strip()
-    m = re.match(r"^(\d{8})T(\d{6})(Z?)$", value)
+    m = re.match(r"^(\d{8})(?:T(\d{6})(Z?))?$", value)
     if not m:
         return None
-    stamp = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
-    if m.group(3) == "Z":
-        stamp = stamp.replace(tzinfo=None) + (datetime.now() - datetime.utcnow())
+    day, clock, zulu = m.group(1), m.group(2), m.group(3)
+    try:
+        stamp = datetime.strptime(day + (clock or "000000"), "%Y%m%d%H%M%S")
+    except ValueError:
+        return None
+    if zulu == "Z":
+        stamp = stamp.replace(tzinfo=timezone.utc).astimezone().replace(tzinfo=None)
     return stamp
 
 
@@ -123,19 +138,27 @@ def escalate_chores(conn, now: datetime | None = None, cfg: dict | None = None) 
     collection = board.LANES["upkeep"][0]
     result = {"raised": 0, "cleared": 0, "watched": 0}
 
+    # A hand-edited upkeep.yaml is a normal event, not an emergency. Neither this
+    # nor the per-chore GET below was guarded, so a typo in the chore file, or a
+    # few seconds of Radicale being unreachable, raised out of run() and stopped
+    # reconcile and triage too.
+    try:
+        chores = upkeep.load()
+    except Exception as e:
+        print(f"[escalate] cannot read chores: {type(e).__name__}: {e}", flush=True)
+        return dict(result, error=f"{type(e).__name__}: {e}")
+
     by_uid = {}
-    for chore in upkeep.load():
+    for chore in chores:
         try:
             uid, _ = upkeep.build(chore)
         except upkeep.ChoreError:
             continue
         by_uid[uid] = chore
 
-    live = {}
-    for item in caldav.list_todos(collection):
-        if item["uid"].startswith(upkeep.UID_PREFIX):
-            live[item["uid"]] = item
-
+    # A `live` dict was built here from list_todos() and then never read -- an
+    # unguarded round trip per pass for nothing. The per-chore GET below is what
+    # actually reads the due date.
     for uid, chore in by_uid.items():
         if not chore.get("essential"):
             continue
@@ -143,8 +166,12 @@ def escalate_chores(conn, now: datetime | None = None, cfg: dict | None = None) 
         source_key = f"chore:{uid}"
         existing = store.task_by_source(conn, source_key)
 
-        raw = caldav._request("GET", caldav._url(collection, f"{uid}.ics"))[2].decode(
-            "utf-8", errors="replace")
+        try:
+            raw = caldav._request("GET", caldav._url(collection, f"{uid}.ics"))[2].decode(
+                "utf-8", errors="replace")
+        except Exception as e:
+            print(f"[escalate] cannot read chore {uid}: {type(e).__name__}: {e}", flush=True)
+            continue                        # one unreadable chore, not the whole pass
         due = _due_of(raw)
         overdue = (now - due) if due else timedelta(0)
         late_enough = due is not None and overdue > grace_for(chore)

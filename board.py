@@ -155,6 +155,17 @@ def alarm_time_for(row, cfg: dict | None = None) -> datetime | None:
     return policy.next_open(row["track"], due, cfg)
 
 
+def _dismissed(row, now: datetime | None = None) -> bool:
+    """Has this task been swiped away, and is that dismissal still in force?"""
+    raw = row["dismissed_until"]
+    if not raw:
+        return False
+    try:
+        return datetime.fromisoformat(raw) > (now or datetime.now())
+    except (TypeError, ValueError):
+        return False
+
+
 def audit(conn) -> list[dict]:
     """Every active task whose card does not match the database.
 
@@ -172,8 +183,18 @@ def audit(conn) -> list[dict]:
         except caldav.CalDavError as e:
             print(f"[audit] {lane}: {e}", flush=True)
 
+    now = datetime.now()
     out = []
     for row in store.active_tasks(conn):
+        # You swiped this away, so reconcile cleared its collection and set
+        # dismissed_until. Without this check the audit reports it as "missing
+        # from the board", rescore_and_sync re-pushes it, and the card is back
+        # within ten minutes WITH its alarm re-armed -- which is the opposite of
+        # what deleting a reminder is documented to mean, and the exact thing
+        # that trains you to swipe without reading. escalate_tasks already
+        # honours this column; the audit did not.
+        if _dismissed(row, now):
+            continue
         tid = row["id"]
         want_pri = _priority(row["score"] or 0.0)
         want_lane = LANE_ALIASES.get(row["lane"], row["lane"])

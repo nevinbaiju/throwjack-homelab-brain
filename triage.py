@@ -201,6 +201,23 @@ def _promote(conn) -> dict:
         return {"promoted": 0, "held": 0, "error": str(e)}
 
 
+def _escalate(conn) -> dict:
+    """Re-arm alarms. Guarded for the same reason _promote is.
+
+    escalate_chores reads upkeep.yaml and talks to CalDAV directly, and neither
+    call was wrapped -- so a hand-edited chore file or a few seconds of Radicale
+    being unreachable raised straight out of run() and took reconcile, the inbox
+    drain and triage down with it. Escalation is the least important thing in the
+    pass; it must never be the thing that stops the rest.
+    """
+    import escalate
+    try:
+        return escalate.run(conn)
+    except Exception as e:
+        print(f"[triage] escalate failed: {type(e).__name__}: {e}", flush=True)
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
 def rescore_and_sync(conn, summary: dict | None = None) -> dict:
     """Rescore every active task, then push the ones whose PRIORITY bucket moved.
 
@@ -268,8 +285,7 @@ def run(conn, limit: int = 25) -> dict:
             c["text"] = strip_scaffolding(stripped) or c["text"]
         if not captures:
             rescore_and_sync(conn, summary)
-            import escalate
-            summary["escalated"] = escalate.run(conn)
+            summary["escalated"] = _escalate(conn)
             summary["promoted"] = _promote(conn)
             store.finish_run(conn, run_id, True, json.dumps(summary))
             return summary
@@ -326,8 +342,7 @@ def run(conn, limit: int = 25) -> dict:
                 summary["failed"] += 1
 
         rescore_and_sync(conn, summary)
-        import escalate
-        summary["escalated"] = escalate.run(conn)
+        summary["escalated"] = _escalate(conn)
         summary["promoted"] = _promote(conn)
         sync_rollups(conn)
         reorder_lanes(conn)
