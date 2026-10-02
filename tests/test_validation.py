@@ -71,7 +71,15 @@ p, r = v('{"today":[],"mutations":[{"op":"add","title":"New","lane":"today"}]}')
 check("add with no consequence lands mid-scale, not at the floor",
       p["mutations"] and p["mutations"][0]["consequence"] == "costs")
 p, r = v(json.dumps({"today":[{"task_id":f"t_{x}","why":"w"} for x in "abcdef"],"mutations":[]}))
-check("the cap warns but never truncates", len(p["today"]) == 6 and r)
+check("a long day is passed through whole -- there is no cap", len(p["today"]) == 6)
+check("...and it is not warned about either",
+      not any("cap" in x for x in r), str(r))
+# set_lane to today would bypass prev_lane and the chore-instance handling that
+# to_today/from_today own, so it stays refused.
+p, r = v('{"today":[],"mutations":[{"op":"set_lane","task_id":"t_a","lane":"today"}]}')
+check("set_lane to today is refused", not p["mutations"] and r)
+p, r = v('{"today":[],"mutations":[{"op":"set_lane","task_id":"t_a","lane":"in_progress"}]}')
+check("set_lane to the retired in_progress is refused", not p["mutations"] and r)
 p, r = v('{"today":[],"mutations":[{"op":"complete","task_id":"t_a"}]}')
 check("a draft may mark something already done", len(p["mutations"]) == 1)
 

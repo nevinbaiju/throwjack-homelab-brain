@@ -74,7 +74,21 @@ Short version:
   overnight sweep. `board.audit` must keep honouring `dismissed_until`, or a
   swipe is silently undone within ten minutes.
 - **Track everything, surface a little.** Caps control what is loud, never what
-  is tracked.
+  is tracked. There is no cap on Today and no work-in-progress cap: a number the
+  system nags about but never enforces is noise you learn to ignore, and it costs
+  the real warnings their credibility.
+- **Today is the only active lane.** `in_progress` was merged into it — they were
+  one answer held in two lists. Work started and unfinished stays on Today and
+  surfaces in the next day's planner as carried over. Nothing auto-promotes into
+  it; the planner is the only thing that puts work on a day. `project.promote` was
+  deleted rather than capped, because with Today as the active lane it would have
+  overwritten the day's decision every ten minutes.
+- **A card you create on your phone becomes a task.** reconcile adopts any item
+  in Today or Backlog whose uid matches no row, keeping the iPhone's own UUID as
+  the task id. Triage then supplies track, consequence and project — never the
+  lane and never the title. Rewriting text the user is looking at is the one
+  thing adoption must not do, which is the same carve-out the `meta` track has.
+  Done is not adopted: ticking is how a completion is recorded.
 
 ## Things that have actually broken
 

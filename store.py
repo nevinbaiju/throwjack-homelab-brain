@@ -235,14 +235,8 @@ def project_tasks(conn, slug: str, include_done: bool = True):
     sql = "SELECT * FROM tasks WHERE archived=0 AND project=?"
     if not include_done:
         sql += " AND status!='completed'"
-    sql += " ORDER BY CASE lane WHEN 'in_progress' THEN 0 WHEN 'backlog' THEN 1 ELSE 2 END, seq, score DESC"
+    sql += " ORDER BY CASE lane WHEN 'today' THEN 0 WHEN 'backlog' THEN 1 ELSE 2 END, seq, score DESC"
     return conn.execute(sql, (slug,)).fetchall()
-
-
-def in_progress_count(conn, slug: str) -> int:
-    return conn.execute(
-        "SELECT COUNT(*) c FROM tasks WHERE archived=0 AND status!='completed' "
-        "AND project=? AND lane='in_progress'", (slug,)).fetchone()["c"]
 
 
 # --- captures -------------------------------------------------------------

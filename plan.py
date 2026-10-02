@@ -22,10 +22,12 @@ from datetime import date
 import board
 import store
 
-# A cap, not a target. The whole point is a list short enough to actually be
-# today's list; without a ceiling the model happily proposes fourteen things
-# and you are back to a backlog with a different name.
-TODAY_CAP = int(os.environ.get("BRAIN_TODAY_CAP", "5"))
+# No cap. There was one, and it only ever produced a warning about a day the
+# user had deliberately chosen -- "today holds 11 items, over the cap of 5",
+# every morning, for a lane that now accumulates carried-over work on purpose.
+# A number the system nags about but never enforces is noise you learn to ignore,
+# and it costs the real warnings their credibility. The prompt still asks for a
+# day you could finish; that is guidance, not arithmetic.
 
 # A chore INSTANCE: one scheduled day of a recurring chore. It is a real task
 # and may be completed or pushed off the day, but its lane is owned by the
@@ -61,12 +63,6 @@ def _upkeep_slug(row) -> str | None:
 # them BACK onto today -- the opposite of what was meant.
 OPS = {"set_lane", "set_blocked", "clear_blocked", "retitle", "note_append",
        "add", "complete", "list_add", "schedule_chore"}
-
-# Chores get their own ceiling. They are 10-20 minute slotted jobs, so counting
-# them against TODAY_CAP would let three loads of washing crowd out the five
-# things the day is actually for -- but without any cap a day can quietly become
-# seven chores and nothing else.
-UPKEEP_CAP = int(os.environ.get("BRAIN_UPKEEP_CAP", "3"))
 
 # Ops an UPDATE may additionally propose. Mid-day reality is different:
 # things get finished and things fall off a day already in motion.
@@ -104,7 +100,7 @@ def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
     today = today or policy.local_today()
 
     lanes: dict[str, list[dict]] = {}
-    for lane in ("today", "in_progress", "backlog"):
+    for lane in ("today", "backlog"):
         lanes[lane] = [slim(r) for r in store.active_tasks(conn, lane)
                        if not _is_legacy_chore(r) and not _is_instance(r)]
 
@@ -148,8 +144,6 @@ def build_context(conn, *, journal: str = "", selected: list[str] | None = None,
     ctx = {
         "date": today.isoformat(),
         "weekday": f"{today:%A}",
-        "cap": TODAY_CAP,
-        "upkeep_cap": UPKEEP_CAP,
         "lanes": lanes,
         "shopping_lists": shops,
         "journal": journal[:2000],
@@ -186,7 +180,7 @@ Reply with ONLY a JSON object, no prose, no code fence:
 {{"today":    [{{"task_id":"<id>","why":"<max 12 words>"}}],
  "mutations":[{{"op":"add","title":"<new task>","lane":"today|backlog",
                "consequence":"breaks|costs|improves|optional","note":"<optional>"}},
-              {{"op":"set_lane","task_id":"<id>","lane":"backlog|in_progress"}},
+              {{"op":"set_lane","task_id":"<id>","lane":"backlog"}},
               {{"op":"set_blocked","task_id":"<id>","blocked_on":"<who or what>"}},
               {{"op":"clear_blocked","task_id":"<id>"}},
               {{"op":"retitle","task_id":"<id>","title":"<new title>"}},
@@ -199,12 +193,16 @@ Reply with ONLY a JSON object, no prose, no code fence:
 
 HOW TO READ THE INPUT. Three cases, and you are usually in the third:
 
+There is no cap on the day. Today is the single active lane -- work that is
+started and unfinished stays there and carries over -- so "lanes.today" is both
+what they are doing now and what they did not finish. There is no in_progress.
+
 1. "selected_by_user" present -> they have pointed at those exact tasks.
    What to DO with them comes from "user_says". Read it first:
      - says they are finished / done / already did them
          -> {{"op":"complete"}} for each. Do NOT put them in "today".
      - says to push them / not today / drop them
-         -> {{"op":"set_lane"}} back to backlog or in_progress.
+         -> {{"op":"from_today"}}, or {{"op":"set_lane"}} to backlog.
      - says nothing about them, or says to do them
          -> they ARE the day: every one goes in "today", ordered, with a why.
    Either way none of them may be ignored, and do not add others unless asked.
@@ -229,7 +227,8 @@ never invent an id for one. To put one on the day, emit
 slot. Rules:
   - Schedule one only when they asked for it, or -- if they have not said what
     the day is -- when it is genuinely due and the day has room.
-    Never more than {UPKEEP_CAP} chores in one day.
+    Be sparing when the choice is yours; schedule as many as they ask for
+    when it is theirs.
   - "selected_upkeep" means they ticked those chores. Schedule every one.
   - Use "time_of_day" as a hint and "est_min" for how long it takes. Slots must
     be between 06:00 and 23:59. Do not stack two chores at the same time.
@@ -246,13 +245,15 @@ slot. Rules:
   is noise at best.
 
 Otherwise, when they have not told you what the day is:
-- At most {TODAY_CAP} items. Fewer is better than more.
-- Prefer finishing what is in_progress over starting something new.
+- Propose a day they could actually finish. A handful of things, not a list.
+  There is no hard limit and you will not be corrected for going over, so the
+  judgement is yours to get right.
+- Prefer finishing something already on today over starting something new.
 - Anything blocked_on someone else does not belong in today unless the action
   IS chasing them.
 - Propose a mutation only when the board is actually wrong -- something
-  in_progress that is really blocked, a title that no longer names the next
-  action.
+  something on today that is really blocked, a title that no longer names
+  the next action.
 - Items already in the "today" lane are yesterday's picks that were not
   finished. Decide each deliberately: keep it if today is still the day,
   otherwise set_lane it back. Carrying something a third day usually means
@@ -315,7 +316,9 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
 
     today: list[dict] = []
     seen: set[str] = set()
-    for item in (data.get("today") or [])[: TODAY_CAP * 3]:
+    # A sanity bound on model output, not a cap on the day: 60 entries is a
+    # runaway reply, not a plan.
+    for item in (data.get("today") or [])[:60]:
         if not isinstance(item, dict):
             rejected.append("today entry was not an object"); continue
         tid = str(item.get("task_id", ""))
@@ -333,17 +336,6 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
                       # than filing it to prev_lane.
                       "is_upkeep": _is_instance(row),
                       "scheduled_at": row["scheduled_at"]})
-    # Advisory, never truncating. Silently dropping the sixth thing you said
-    # you were doing today is worse than an overfull list: you would not know
-    # it had gone. The cap is guidance to the model in the prompt and a
-    # warning to you here.
-    n_today = len([t for t in today if not t["is_upkeep"]]) + sum(
-        1 for m_ in (data.get("mutations") or [])
-        if isinstance(m_, dict) and m_.get("op") == "add"
-        and m_.get("lane") == "today")
-    if n_today > TODAY_CAP:
-        rejected.append(f"today holds {n_today} items, over the cap of {TODAY_CAP}")
-
     # Same validator as the update path -- see _resolve(). OPS (not
     # UPDATE_OPS) is what limits a draft to choosing the day rather than
     # completing or inventing tasks.
@@ -367,11 +359,6 @@ def validate(conn, raw: str) -> tuple[dict, list[str]]:
             seen_slugs.add(m_["slug"])
         kept.append(m_)
     muts = kept
-
-    scheduled = len(seen_slugs) + len([t for t in today if t["is_upkeep"]])
-    if scheduled > UPKEEP_CAP:
-        rejected.append(f"{scheduled} chores scheduled, over the upkeep cap "
-                        f"of {UPKEEP_CAP}")
 
     _key_mutations(muts)
     return ({"today": today, "mutations": muts,
@@ -783,7 +770,7 @@ def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
         if not title:
             return None, "add with no title"
         lane = str(m.get("lane", "backlog"))
-        if lane not in ("today", "backlog", "in_progress"):
+        if lane not in ("today", "backlog"):
             lane = "backlog"
         # Without a consequence the task scores 0, which is PRIORITY 9 on the
         # phone -- the bottom of every list. Tasks that arrive through capture
@@ -839,7 +826,9 @@ def _resolve(conn, rows, m, allowed) -> tuple[dict | None, str | None]:
 
     if op == "set_lane":
         lane = str(m.get("lane", ""))
-        if lane not in ("backlog", "in_progress"):
+        # Today is reached through to_today / from_today, which handle prev_lane
+        # and chore instances. in_progress is gone -- it is Today now.
+        if lane != "backlog":
             return None, f"refused set_lane to {lane!r}"
         return {"op": op, "task_id": tid, "lane": lane,
                 "title": row["title"]}, None
@@ -892,18 +881,6 @@ def validate_update(conn, raw: str) -> tuple[dict, list[str]]:
             rejected.append(why or "rejected")
         else:
             muts.append(clean)
-
-    # The cap is advisory here, not enforced. Mid-day, "the boiler guy is
-    # coming at 3" is not negotiable just because the list was already full --
-    # but you should be told the day is now overcommitted.
-    adds = sum(1 for m_ in muts if m_["op"] == "to_today"
-               or (m_["op"] == "add" and m_["lane"] == "today"))
-    removes = sum(1 for m_ in muts if m_["op"] in ("from_today", "complete"))
-    if adds:
-        current = len([r for r in store.active_tasks(conn, "today")])
-        after = current + adds - removes
-        if after > TODAY_CAP:
-            rejected.append(f"today would hold {after} items, over the cap of {TODAY_CAP}")
 
     _key_mutations(muts)
     return {"mutations": muts, "notes": str(data.get("notes", ""))[:400]}, rejected

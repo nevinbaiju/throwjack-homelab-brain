@@ -27,15 +27,14 @@ LANES: dict[str, tuple[str, str]] = {
     # the way out, so nothing has to guess.
     "today":       ("today", "Today"),
     "backlog":     ("backlog", "Backlog"),
-    "in_progress": ("in-progress", "In Progress"),
     "done":        ("done", "Done"),
 }
 
-# The brain has a `waiting` lane (handed off, blocked on someone else) but you
-# asked for four lists, so it shares Backlog rather than adding a fifth. The
-# track stays `waiting` in the database, so chase intervals still work, and the
-# item body says who you are waiting on. Backlog rather than In Progress on
-# purpose: blocked work sitting in In Progress inflates how loaded you look.
+# The brain has a `waiting` lane (handed off, blocked on someone else) but it
+# shares Backlog rather than adding a list. The track stays `waiting` in the
+# database, so chase intervals still work, and the item body says who you are
+# waiting on. Backlog rather than Today on purpose: blocked work sitting in the
+# active lane inflates how loaded the day looks.
 #
 # `upkeep` is aliased rather than simply deleted. collection_for() raises KeyError
 # on an unknown lane -- not CalDavError -- so every `except caldav.CalDavError`
@@ -43,7 +42,13 @@ LANES: dict[str, tuple[str, str]] = {
 # kill reconcile, the inbox drain and triage outright. The alias is a permanent
 # net, not the migration: reconcile() repoints such rows below, because an aliased
 # lane is invisible to same_lane() and to every planner query.
-LANE_ALIASES = {"waiting": "backlog", "upkeep": "backlog"}
+#
+# `in_progress` is merged into `today`. They were the same thing in practice:
+# work started and not finished stays started, and "what am I doing today" and
+# "what is underway" were two lists holding one answer. Today is now the single
+# active lane, uncapped, and yesterday's unfinished items surface in the planner
+# as carried over.
+LANE_ALIASES = {"waiting": "backlog", "upkeep": "backlog", "in_progress": "today"}
 
 
 def collection_for(lane: str) -> str:
@@ -288,9 +293,15 @@ def reconcile(conn) -> dict:
     for lane, (collection, _) in LANES.items():
         for item in caldav.list_todos(collection):
             task_id = item["uid"]
+            # No archived= filter on purpose: an archived task's card still
+            # matches its row, so adopt() below can never resurrect one.
             row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
             if row is None:
-                continue                       # not ours; yours to keep
+                adopted = adopt(conn, item, lane, collection)
+                if adopted is None:
+                    continue                   # not ours; yours to keep
+                result["adopted"] = result.get("adopted", 0) + 1
+                row = adopted
             seen.add(task_id)
 
             if row["caldav_collection"] != collection:
@@ -363,16 +374,90 @@ def reconcile(conn) -> dict:
             "WHERE id=?", (_end_of_day(), row["id"]))
         result["dismissed"] += 1
 
-    # Self-heal any row left in the retired `upkeep` lane. LANE_ALIASES keeps
-    # collection_for() from raising on one, but an aliased lane is invisible to
-    # same_lane() and to every planner query -- so without this the row is a
-    # silent black hole rather than a crash.
-    stranded = conn.execute(
-        "UPDATE tasks SET lane='backlog', updated_at=? WHERE archived=0 AND lane='upkeep'",
-        (store_now(),)).rowcount
-    if stranded:
-        result["repointed_from_upkeep"] = stranded
+    # Self-heal rows left in a retired lane. LANE_ALIASES keeps collection_for()
+    # from raising on one, but an aliased lane is invisible to same_lane() and to
+    # every planner query -- so without this the row is a silent black hole
+    # rather than a crash.
+    for dead, live in (("upkeep", "backlog"), ("in_progress", "today")):
+        n = conn.execute("UPDATE tasks SET lane=?, updated_at=? WHERE archived=0 AND lane=?",
+                         (live, store_now(), dead)).rowcount
+        if n:
+            result[f"repointed_from_{dead}"] = n
+
+    # An archived row's card is nobody else's job. board.audit only walks ACTIVE
+    # tasks, so a card left behind when a row was archived is never audited and
+    # never cleaned up, while the loop above keeps reading it -- an immortal card.
+    # Three of them were sitting in In Progress from the upkeep migration, which
+    # archived the nudge rows without removing their cards.
+    for row in conn.execute(
+            "SELECT * FROM tasks WHERE archived=1 AND caldav_collection IS NOT NULL").fetchall():
+        remove_task(conn, row)
+        result["orphan_cards_removed"] = result.get("orphan_cards_removed", 0) + 1
     return result
+
+
+# Lanes you can type into. Done is excluded: an item added straight to Done is
+# ambiguous (did you do it, or is it a note to yourself?) and the gesture that
+# records a completion is ticking, which already works.
+ADOPT_LANES = {"today", "backlog"}
+
+
+def adopt(conn, item: dict, lane: str, collection: str):
+    """Take a card you created on your phone and make it a real task. -> row.
+
+    reconcile is identity-keyed: it looks a card up by uid, and the brain mints
+    its own ids, so anything YOU created in Reminders had no row and was skipped
+    forever with "not ours; yours to keep". Only the Inbox list was ever ingested.
+    That was true of five items sitting in Backlog, one of which had already been
+    ticked off.
+
+    The iPhone's own UUID becomes the task id. The alternative -- delete the card
+    and re-push it as t_* -- means a visible flicker and, worse, a window where
+    the delete lands and the re-add fails and the item is simply gone. Keeping the
+    uid makes the card you are looking at become tracked in place, and makes this
+    idempotent for free: next pass finds the row by id and never reaches here.
+
+    Returns None for anything that should stay yours.
+    """
+    if lane not in ADOPT_LANES:
+        return None
+    title = (item.get("summary") or "").strip()
+    if not title:
+        return None                            # an empty card is not a task
+
+    completed = item.get("status") == "COMPLETED"
+    task_id = store.create_task(
+        conn, id=item["uid"], title=title, note=(item.get("description") or "")[:2000],
+        # flow/costs are placeholders. triage replaces both on this pass -- see
+        # the adopted-capture branch in triage.run -- but if the model call fails
+        # the task still exists, in the right lane, scoring mid-scale rather than
+        # sitting at the floor with no consequence.
+        track="flow", consequence="costs", lane=lane)
+    conn.execute(
+        "UPDATE tasks SET caldav_collection=?, caldav_etag=?, source_key=? WHERE id=?",
+        (collection, item.get("etag"), f"phone:{collection}", task_id))
+    if completed:
+        conn.execute("UPDATE tasks SET status='completed', completed_at=? WHERE id=?",
+                     (store_now(), task_id))
+
+    # Hand it to triage for a track, a consequence and a project -- but NOT a new
+    # task and NOT a new title. The capture carries the task id, which is what
+    # tells triage to enrich this row instead of creating a second one.
+    try:
+        import store as _store
+        cid = f"c_{_store.secrets.token_hex(6)}"
+        _store.ingest_capture(conn, {
+            "id": cid, "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "local": store_now(), "source": "phone-adopt",
+            "text": title + (("\n" + item["description"]) if item.get("description") else "")})
+        conn.execute("UPDATE captures SET task_id=? WHERE id=?", (task_id, cid))
+    except Exception as e:                                   # noqa: BLE001
+        # The task is already real and on the right lane; classification is a
+        # bonus. Losing it must not lose the adoption.
+        print(f"[adopt] {task_id}: no capture written: {type(e).__name__}: {e}", flush=True)
+
+    print(f"[adopt] {collection}/{task_id} -> {title!r}", flush=True)
+    return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
 
 
 def _note_chore(conn, task_id: str, *, done: bool) -> None:

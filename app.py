@@ -285,7 +285,7 @@ async def board(authorization: str | None = Header(default=None),
     conn = store.connect()
     try:
         lines = []
-        for lane in ("today", "backlog", "in_progress", "waiting", "done"):
+        for lane in ("today", "backlog", "waiting", "done"):
             rows = store.active_tasks(conn, lane)
             if not rows:
                 continue
@@ -378,12 +378,11 @@ async def project_status(slug: str, authorization: str | None = Header(default=N
             out += ["", proj["summary"]]
         out += ["", f"progress: {len(done)}/{len(rows)} done", ""]
 
-        for lane, label in (("in_progress", "IN PROGRESS"), ("backlog", "NEXT UP")):
+        for lane, label in (("today", "TODAY"), ("backlog", "NEXT UP")):
             group = [r for r in rows if r["lane"] == lane and r["status"] != "completed"]
             if not group:
                 continue
-            cap = f"  (cap {project.FOCUS_CAP})" if lane == "in_progress" else ""
-            out.append(f"{label}{cap}")
+            out.append(label)
             for r in group:
                 est = f"{r['estimate_min']}m" if r["estimate_min"] else "  -"
                 out.append(f"  {r['seq'] or 0:>2}. {est:>5}  {r['title'][:60]}")
@@ -432,7 +431,7 @@ async def board_json(authorization: str | None = Header(default=None),
                 "pinned": pinned, "status": r["status"],
             })
         return {"lanes": lanes,
-                "order": ["today", "in_progress", "backlog", "waiting", "done"]}
+                "order": ["today", "backlog", "waiting", "done"]}
     finally:
         conn.close()
 
@@ -1121,6 +1120,9 @@ async def plan_today_json(authorization: str | None = Header(default=None),
             return {"id": r["id"], "title": r["title"], "lane": r["lane"],
                     "blocked_on": r["blocked_on"], "project": r["project"],
                     "is_upkeep": is_upkeep,
+                    # So you can see adoption working: this card was typed into a
+                    # list on the phone rather than captured.
+                    "from_phone": str(r["source_key"] or "").startswith("phone:"),
                     "at": (r["scheduled_at"] or "")[11:16] or None,
                     "estimate_min": r["estimate_min"],
                     # A chore instance is created for one day and archived if it
@@ -1133,7 +1135,7 @@ async def plan_today_json(authorization: str | None = Header(default=None),
 
         rows = conn.execute(
             "SELECT * FROM tasks WHERE archived=0 AND status!='completed'"
-            " AND lane IN ('today','in_progress','backlog')"
+            " AND lane IN ('today','backlog')"
             # Slotted things first, in time order: a day with "laundry at 19:00"
             # in it reads as a schedule. today_seq preserves the order the plan
             # was accepted in; `seq` is project ordering and is not ours to use.

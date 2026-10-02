@@ -25,7 +25,7 @@ def mk(tid, title, lane):
     conn.execute("INSERT INTO tasks (id,title,note,track,lane,status,score,consequence,"
       "created_at,updated_at,touched_at) VALUES (?,?,'',?,?,'needs_action',40,'costs',?,?,?)",
       (tid, title, "focus", lane, now, now, now))
-mk("t_p", "In-progress thing", "in_progress")
+mk("t_p", "Another backlog thing", "backlog")
 mk("t_q", "Backlog thing", "backlog")
 mk("t_r", "Carried from before", "today")
 conn.execute("UPDATE tasks SET prev_lane='backlog' WHERE id='t_r'")
@@ -40,8 +40,9 @@ check("is_current", d["is_current"], False)
 check("pending", d["pending"], None)
 check("carried item present", [t["title"] for t in d["today"]], ["Carried from before"])
 check("carried is labelled", d["today"][0]["carried_from"] is not None, True)
-check("pool has in_progress + backlog", sorted(t["lane"] for t in d["pool"]),
-      ["backlog", "in_progress"])
+# in_progress was merged into today, so the pool is backlog only. Today is the
+# single active lane and its contents are reported as `today`, not as pool.
+check("pool is backlog only", sorted(set(t["lane"] for t in d["pool"])), ["backlog"])
 
 print("\n== a request still in flight is reported, not hidden ==")
 conn.execute("INSERT INTO plan_jobs (id,kind,state,context,created_at,updated_at)"

@@ -37,6 +37,23 @@ for lane in ("today", "backlog", "in_progress", "done", "waiting"):
 
 check("a capture triaged as upkeep lands in the backlog",
       store.LANE_FOR_TRACK["upkeep"] == "backlog")
+
+# --- in_progress merged into today --------------------------------------
+check("the in_progress lane is gone", "in_progress" not in board.LANES)
+check("in_progress resolves to today, not an exception",
+      board.collection_for("in_progress") == "today")
+check("its collection is no longer brain-owned",
+      "in-progress" not in board.BRAIN_OWNED)
+import project
+check("promote is deleted, not just capped", not hasattr(project, "promote"))
+check("FOCUS_CAP is gone", not hasattr(project, "FOCUS_CAP"))
+check("in_progress_count is gone", not hasattr(store, "in_progress_count"))
+check("the `doing` directive now means today",
+      project._DIRECTIVE_LANE["doing"][0] == "today")
+import plan
+check("there is no today cap", not hasattr(plan, "TODAY_CAP"))
+check("there is no upkeep cap", not hasattr(plan, "UPKEEP_CAP"))
+check("no cap is advertised to the model", "cap of" not in plan.SYSTEM)
 check("upkeep is still a track", "upkeep" in store.TRACKS)
 
 # policy still knows the track. Instances carry track='upkeep', and policy.py
@@ -63,6 +80,27 @@ res = board.reconcile(conn)
 check("reconcile repoints a row left in the dead lane",
       conn.execute("SELECT lane FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "backlog")
 check("...and says it did", res.get("repointed_from_upkeep") == 1, str(res))
+
+# A row stranded in the merged-away lane heals the same way.
+tid2 = store.create_task(conn, title="Was in progress", track="focus", lane="in_progress")
+res = board.reconcile(conn)
+check("reconcile repoints a row left in in_progress to today",
+      conn.execute("SELECT lane FROM tasks WHERE id=?", (tid2,)).fetchone()[0] == "today")
+check("...and says it did", res.get("repointed_from_in_progress") == 1, str(res))
+
+# An archived row's card is nobody else's job: audit only walks ACTIVE tasks, so
+# without this sweep the card lives forever while reconcile keeps reading it.
+# Three such cards were sitting in In Progress after the upkeep migration.
+orphan = store.create_task(conn, title="Archived but still carded", track="flow")
+conn.execute("UPDATE tasks SET archived=1, caldav_collection='backlog' WHERE id=?", (orphan,))
+res = board.reconcile(conn)
+check("reconcile removes the card of an archived row",
+      conn.execute("SELECT caldav_collection FROM tasks WHERE id=?", (orphan,)).fetchone()[0] is None)
+check("...and counts it", res.get("orphan_cards_removed") == 1, str(res))
+check("the archived row itself is untouched -- nothing is deleted",
+      conn.execute("SELECT archived,title FROM tasks WHERE id=?", (orphan,)).fetchone()[0] == 1)
+res = board.reconcile(conn)
+check("the orphan sweep is idempotent", not res.get("orphan_cards_removed"), str(res))
 
 # board.audit must not resurrect a card you swiped away. This was broken for
 # every task, not just chores: audit ignored dismissed_until, so rescore_and_sync

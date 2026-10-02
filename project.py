@@ -25,7 +25,9 @@ CONTEXTS = store.BRAIN_ROOT / "contexts"
 # Shipped with the code, rendered into CONTEXTS at runtime. See
 # ensure_root_context().
 ROOT_CONTEXT_SRC = Path(__file__).with_name("contexts")
-FOCUS_CAP = 3
+# No work-in-progress cap. Today is uncapped on purpose: work that is started
+# and unfinished stays started, and a cap only ever meant the brain arguing with
+# a decision already made.
 
 SYSTEM = """You turn a raw brain-dump about one project into a concrete plan.
 
@@ -130,7 +132,7 @@ def validate_plan(raw: str) -> dict:
         seq = seq if isinstance(seq, int) and not isinstance(seq, bool) else n + 1
 
         # The cap is enforced here, not trusted to the model.
-        start = bool(t.get("start_now")) and started < FOCUS_CAP
+        start = bool(t.get("start_now"))
         started += int(start)
 
         tasks.append({"title": title[:255], "why": (t.get("why") or "").strip()[:300],
@@ -213,20 +215,18 @@ def dump(conn, slug: str, text: str, alias: str = "brain-plan") -> dict:
                              plan["deadline"], json.dumps(plan["open_questions"]))
         summary["questions"] = len(plan["open_questions"])
 
-        room = FOCUS_CAP - store.in_progress_count(conn, slug)
         for t in plan["tasks"]:
             if store.find_duplicate(conn, t["title"], "focus"):
                 summary["duplicates"] += 1
                 continue
-            lane = "in_progress" if (t["start_now"] and room > 0) else "backlog"
+            lane = "today" if t["start_now"] else "backlog"
             task_id = store.create_task(
                 conn, title=t["title"], note=t["why"], track="focus", project=slug,
                 consequence=t["consequence"], estimate_min=t["estimate_min"],
                 due=t["due"] or plan["deadline"], lane=lane,
             )
             conn.execute("UPDATE tasks SET seq=?, why=? WHERE id=?", (t["seq"], t["why"], task_id))
-            if lane == "in_progress":
-                room -= 1
+            if lane == "today":
                 summary["started"] += 1
             triage.project_to_board(conn, task_id)
             summary["created"] += 1
@@ -346,8 +346,10 @@ def write_context(conn, slug: str) -> Path:
     # neither in_progress nor backlog and silently disappears from STATE.md --
     # so a coding agent reading this folder would re-plan work already chosen
     # for the day.
+    # Today is the active lane; in_progress was merged into it. Without a bucket
+    # for it a task picked for today matched neither and silently vanished from
+    # STATE.md, so an agent reading this folder would re-plan work already chosen.
     today = [r for r in rows if r["lane"] == "today" and r["status"] != "completed"]
-    doing = [r for r in rows if r["lane"] == "in_progress" and r["status"] != "completed"]
     todo = [r for r in rows if r["lane"] == "backlog" and r["status"] != "completed"]
 
     lines = [f"# {proj['name'] if proj else slug} — state",
@@ -357,8 +359,7 @@ def write_context(conn, slug: str) -> Path:
     if proj and proj["deadline"]:
         lines += [f"**Deadline:** {proj['deadline']}", ""]
     lines += [f"**Progress:** {len(done)} done / {len(rows)} total", ""]
-    for label, group in (("Today", today), ("In progress", doing),
-                         ("Next up", todo), ("Done", done)):
+    for label, group in (("Today", today), ("Next up", todo), ("Done", done)):
         if not group:
             continue
         lines.append(f"## {label}")
@@ -430,7 +431,7 @@ Write a capture whose FIRST line is a directive, using the id from tasks.json:
 
     done: t_abc123def456
 
-`done` closes it, `doing` promotes it to In Progress, `blocked` moves it to
+`done` closes it, `doing` moves it onto Today, `blocked` moves it to
 Waiting, `drop` archives it. Anything after the first line is kept as a note.
 Without this, nothing you do can close a card — captures only ever create.
 
@@ -495,84 +496,17 @@ def log_event(slug: str | None, line: str) -> None:
         print(f"[log] {slug}: {e}", flush=True)
 
 
-def promote(conn, cfg: dict | None = None) -> dict:
-    """Refill each project's In Progress from its backlog, and announce the move.
-
-    Nothing promoted a task after creation: FOCUS_CAP was consulted once, at
-    plan time, so when In Progress emptied the backlog just sat there. This is
-    the refill.
-
-    Gated on policy.can_notify for the task's own track, so nothing moves or
-    buzzes during downtime -- waking up to three tasks that silently started
-    overnight is worse than waking up to none.
-
-    The alarm is set explicitly rather than via alarm_time_for(), which returns
-    None for a task with no due date. The point here is to announce the move,
-    which has nothing to do with whether a deadline exists.
-    """
-    cfg = cfg or policy.load_config()
-    now = datetime.now()
-    out: dict = {"promoted": 0, "held": 0, "titles": []}
-
-    # Tasks with no project are their own group, not skipped. A P0 filed from
-    # the phone has no project, and "always outranks" cannot mean "except when
-    # it does not belong to anything".
-    groups = [r["project"] for r in conn.execute(
-        "SELECT DISTINCT project FROM tasks WHERE archived=0 AND status!='completed'")]
-
-    for slug in groups:
-        if slug:
-            scope, params = "project=?", (slug,)
-        else:
-            scope, params = "(project IS NULL OR project='')", ()
-        in_progress = conn.execute(
-            f"SELECT COUNT(*) c FROM tasks WHERE archived=0 AND status!='completed' "
-            f"AND {scope} AND lane='in_progress'", params).fetchone()["c"]
-        room = FOCUS_CAP - in_progress
-        stamp = now.isoformat(timespec="seconds")
-        # Pinned first, then sequence, then score. A P0 is an override: it is
-        # promoted even when In Progress is already at the cap, because the
-        # whole point of saying P0 is that it displaces the plan.
-        candidates = conn.execute(
-            f"SELECT * FROM tasks WHERE archived=0 AND status!='completed' "
-            f"AND {scope} AND lane='backlog' "
-            f"ORDER BY CASE WHEN pinned_until IS NOT NULL AND pinned_until > ? "
-            f"THEN 0 ELSE 1 END, seq, score DESC", (*params, stamp)).fetchall()
-        for row in candidates:
-            pinned = bool(row["pinned_until"]) and str(row["pinned_until"]) > stamp
-            if room <= 0 and not pinned:
-                break
-            if not policy.can_notify(row["track"], now, cfg):
-                out["held"] += 1
-                continue
-            ts = store.now_iso()
-            # A promotion is a fresh nudge, not a continuation of an old
-            # escalation chain: reset the counter and own last_alarm_at
-            # outright, because write_task only sets it when it is NULL.
-            #
-            # The alarm is a minute out, not "now": escalate_tasks re-arms
-            # anything whose last_alarm_at has already passed, and running in
-            # the same pass it would push this to +2h before the phone ever
-            # saw it.
-            announce = now + timedelta(minutes=1)
-            conn.execute(
-                "UPDATE tasks SET lane='in_progress', touched_at=?, updated_at=?, "
-                "escalations=0, last_alarm_at=? WHERE id=?",
-                (ts, ts, announce.isoformat(timespec="seconds"), row["id"]))
-            fresh = conn.execute("SELECT * FROM tasks WHERE id=?", (row["id"],)).fetchone()
-            try:
-                board.write_task(conn, fresh, alarm_at=announce)
-                out["promoted"] += 1
-                out["titles"].append(fresh["title"])
-                log_event(slug, f"**promoted**{' (P0)' if pinned else ''} "
-                                f"`{row['id']}` — {fresh['title']}")
-                if not pinned:
-                    room -= 1
-            except caldav.CalDavError as e:
-                # Put it back: a lane change the phone never saw is a lie.
-                conn.execute("UPDATE tasks SET lane='backlog' WHERE id=?", (row["id"],))
-                print(f"[promote] {row['id']} rolled back: {e}", flush=True)
-    return out
+# promote() lived here. It refilled each project's In Progress from its backlog
+# up to FOCUS_CAP and announced the move with an alarm.
+#
+# Deleted, not capped. Its whole job was moving work into the active lane on the
+# brain's initiative -- and now that the active lane IS Today, that means
+# overwriting the decision made in the planner, every ten minutes, behind the
+# user's back. The planner is the only thing that puts work on a day.
+#
+# It was also the only code that set last_alarm_at on a task with no due date, so
+# alarms now come from exactly three places: a chore's time slot, a real due
+# date, and escalation of those.
 
 
 def ingest_all_captures_by_project(conn) -> dict[str, int]:
@@ -615,7 +549,7 @@ _DIRECTIVE_RE = re.compile(
 # rest, with no command for Nevin to remember.
 _REPLAN_RE = re.compile(r"^\s*(?:replan|context)\s*:[ \t]*", re.IGNORECASE)
 
-_DIRECTIVE_LANE = {"done": ("done", "completed"), "doing": ("in_progress", "needs_action"),
+_DIRECTIVE_LANE = {"done": ("done", "completed"), "doing": ("today", "needs_action"),
                    "blocked": ("waiting", "needs_action"), "drop": (None, None)}
 
 

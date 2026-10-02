@@ -24,8 +24,8 @@ for t in "abcd": mk(f"t_{t}", f"task {t}")
 
 print("== 1. keys exist and are content-derived ==")
 raw = json.dumps({"today":[{"task_id":"t_a","why":"w"}],"mutations":[
-    {"op":"set_lane","task_id":"t_b","lane":"in_progress"},
-    {"op":"set_lane","task_id":"t_c","lane":"backlog"},
+    {"op":"set_lane","task_id":"t_b","lane":"backlog"},
+    {"op":"retitle","task_id":"t_c","title":"renamed"},
     {"op":"note_append","task_id":"t_d","text":"one"},
     {"op":"note_append","task_id":"t_d","text":"two"},
     {"op":"add","title":"New thing","lane":"today","consequence":"costs"}]})

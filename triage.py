@@ -191,16 +191,6 @@ def reorder_lanes(conn) -> dict[str, int]:
     return {}
 
 
-def _promote(conn) -> dict:
-    """Refill In Progress. Local import: project imports triage, not the reverse."""
-    import project
-    try:
-        return project.promote(conn)
-    except Exception as e:
-        print(f"[triage] promote failed: {type(e).__name__}: {e}", flush=True)
-        return {"promoted": 0, "held": 0, "error": str(e)}
-
-
 def _sweep_upkeep(conn) -> dict:
     """Archive yesterday's unfinished chore instances.
 
@@ -217,7 +207,7 @@ def _sweep_upkeep(conn) -> dict:
 
 
 def _escalate(conn) -> dict:
-    """Re-arm alarms. Guarded for the same reason _promote is.
+    """Re-arm alarms. Guarded for the same reason the upkeep sweep is.
 
     escalate_chores reads upkeep.yaml and talks to CalDAV directly, and neither
     call was wrapped -- so a hand-edited chore file or a few seconds of Radicale
@@ -280,8 +270,7 @@ def rescore_and_sync(conn, summary: dict | None = None) -> dict:
 def run(conn, limit: int = 25) -> dict:
     run_id = store.start_run(conn, "triage")
     summary = {"reconciled": {}, "from_siri": 0, "ingested": 0, "triaged": 0,
-               "duplicates": 0, "failed": 0, "carded": 0, "repriced": 0,
-               "promoted": {}}
+               "duplicates": 0, "failed": 0, "carded": 0, "repriced": 0}
     try:
         board.bootstrap()
         summary["reconciled"] = reconcile(conn)
@@ -303,7 +292,6 @@ def run(conn, limit: int = 25) -> dict:
         if not captures:
             rescore_and_sync(conn, summary)
             summary["escalated"] = _escalate(conn)
-            summary["promoted"] = _promote(conn)
             store.finish_run(conn, run_id, True, json.dumps(summary))
             return summary
 
@@ -319,19 +307,17 @@ def run(conn, limit: int = 25) -> dict:
             store.finish_run(conn, run_id, False, str(e))
             return summary
 
-        for item in items:
-            existing = store.find_duplicate(conn, item["title"], item["track"])
-            if existing:
-                store.mark_capture(conn, item["capture_id"], "done", existing)
-                summary["duplicates"] += 1
-                continue
-            task_id = store.create_task(conn, **item)
-            store.mark_capture(conn, item["capture_id"], "done", task_id)
+        # A capture that already points at a task is an ADOPTED card -- something
+        # typed straight into a list on the phone, which board.adopt() turned into
+        # a real task before the model ever saw it. Those get classified, never
+        # re-created.
+        adopted = {c["id"]: c["task_id"] for c in captures if c.get("task_id")}
 
-            # What you typed wins over whatever the model inferred.
-            if item["capture_id"] in work:
+        def user_overrides(task_id: str, capture_id: str) -> None:
+            """What you typed beats what the model inferred. Shared by both paths."""
+            if capture_id in work:
                 conn.execute("UPDATE tasks SET track='meta' WHERE id=?", (task_id,))
-            lvl = levels.get(item["capture_id"])
+            lvl = levels.get(capture_id)
             if lvl == 0:
                 pin = (datetime.now() + timedelta(days=365)).isoformat(timespec="seconds")
                 conn.execute(
@@ -341,6 +327,45 @@ def run(conn, limit: int = 25) -> dict:
             elif lvl is not None:
                 conn.execute("UPDATE tasks SET consequence=? WHERE id=?",
                              (_PRIORITY_CONSEQUENCE[lvl], task_id))
+
+        for item in items:
+            pre = adopted.get(item["capture_id"])
+            if pre:
+                # Track, consequence and project only. The LANE is where you put
+                # it and the TITLE is what you typed -- "the user always wins", and
+                # the prompt's title rule would rewrite "Server fix" into something
+                # else while you are looking at the card. Same carve-out the meta
+                # track already has.
+                conn.execute(
+                    "UPDATE tasks SET track=?, consequence=COALESCE(?, consequence),"
+                    " project=COALESCE(?, project), updated_at=? WHERE id=?",
+                    (item["track"], item.get("consequence"), item.get("project"),
+                     store.now_iso(), pre))
+                # A "P1: " you typed on the card is a directive, so it still sets
+                # the priority -- but the prefix is NOT stripped from the title.
+                # Rewriting text you are looking at is the one thing adoption must
+                # never do.
+                user_overrides(pre, item["capture_id"])
+                store.mark_capture(conn, item["capture_id"], "done", pre)
+                summary["adopted"] = summary.get("adopted", 0) + 1
+                if item.get("project"):
+                    import project
+                    project.log_event(item["project"],
+                                      f"**from your phone** `{pre}` — {item['title']}")
+                continue
+
+            # find_duplicate must run AFTER the adopted branch: an adopted task
+            # has the same normalised title on the same track, so it would match
+            # here and the classification would be thrown away with a "duplicate".
+            existing = store.find_duplicate(conn, item["title"], item["track"])
+            if existing:
+                store.mark_capture(conn, item["capture_id"], "done", existing)
+                summary["duplicates"] += 1
+                continue
+            task_id = store.create_task(conn, **item)
+            store.mark_capture(conn, item["capture_id"], "done", task_id)
+
+            user_overrides(task_id, item["capture_id"])
 
             if item.get("project"):
                 import project
@@ -360,7 +385,6 @@ def run(conn, limit: int = 25) -> dict:
 
         rescore_and_sync(conn, summary)
         summary["escalated"] = _escalate(conn)
-        summary["promoted"] = _promote(conn)
         sync_rollups(conn)
         reorder_lanes(conn)
         store.finish_run(conn, run_id, True, json.dumps(summary))

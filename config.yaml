@@ -45,7 +45,8 @@ tolerance_days:
   upkeep:  null    # upkeep uses cadence + the escalation ladder instead
   someday: null
 
-focus_cap_per_project: 3
+# focus_cap_per_project is gone: Today is the single active lane and it is
+# uncapped. A cap only ever meant the brain arguing with a decision already made.
 
 # Retired with the move to CalDAV: Backlog is a real Reminders list now, so
 # every step is its own individually checkable item.

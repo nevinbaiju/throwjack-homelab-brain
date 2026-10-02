@@ -31,9 +31,10 @@ four attempts, because endless nagging just teaches you to swipe.
 Six lists, five of them a lie you tell yourself. The rules that survived contact
 with real use:
 
-- **Track everything, surface a little.** A global work-in-progress cap makes
-  you *forget* things. The cap here is 3 per project, it is a nudge rather than
-  an eviction, and nothing ever leaves the system.
+- **Track everything, surface a little.** Nothing ever leaves the system, and
+  nothing is capped either. Today is the single active lane and it holds as much
+  as you put on it — a limit the system only ever *warns* about is noise you
+  learn to ignore, and it spends the credibility of the warnings that matter.
 - **Priority is computed, not a field.** You set one thing — what happens if it
   never gets done — and deadline, age, blocking and effort do the rest. Priority
   fields rot; `P1` inflates until everything is `P1`.

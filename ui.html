@@ -251,7 +251,7 @@ for (const [name, id] of Object.entries(TABS)){
   else console.warn('tab button missing:', id);
 }
 
-const LANE_LABEL = {today:'Today', in_progress:'In progress', backlog:'Backlog', waiting:'Waiting', done:'Done'};
+const LANE_LABEL = {today:'Today', backlog:'Backlog', waiting:'Waiting', done:'Done'};
 
 function esc(t){ const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
 
@@ -699,7 +699,7 @@ function renderBoard(data){
             '<div class="meta">' + metaLine(t) + '</div></div>' +
           (isDone ? '' :
             '<div class="acts">' +
-              (lane === 'in_progress' ? '' : '<button data-verb="doing" title="move to In progress">start</button>') +
+              (lane === 'today' ? '' : '<button data-verb="doing" title="move onto Today">today</button>') +
               (lane === 'waiting' ? '' : '<button data-verb="blocked" title="move to Waiting">wait</button>') +
               '<button data-verb="drop" title="archive">drop</button>' +
             '</div>') +
@@ -904,12 +904,13 @@ async function renderToday(warnIn){
            '</div>';
   }
 
+  // Today is the only active lane now, so what was "In progress" is simply what
+  // is already on today and did not get finished -- it leads the list because it
+  // is the most likely thing to still matter.
   const rows = [];
   if (d.today.length) rows.push(['Carried over', d.today]);
-  const doing = d.pool.filter(t => t.lane === 'in_progress');
-  const back  = d.pool.filter(t => t.lane === 'backlog');
-  if (doing.length) rows.push(['In progress', doing]);
-  if (back.length)  rows.push(['Backlog', back]);
+  const back = d.pool.filter(t => t.lane === 'backlog');
+  if (back.length) rows.push(['Backlog', back]);
   if (!rows.length && !chores.length)
     out += '<p class="empty">Nothing in progress or backlog.</p>';
   for (const [label, items] of rows){
@@ -917,9 +918,12 @@ async function renderToday(warnIn){
     for (const t of items){
       out += '<label class="pick"><input type="checkbox" value="' + esc(t.id) + '">' +
              '<div><div class="t">' + esc(t.title) + '</div>' +
+             (t.from_phone && t.lane !== 'today'
+                ? '<div class="why">added on your phone</div>' : '') +
              (t.is_upkeep ? '<div class="why">upkeep' +
                 (t.at ? ' at ' + esc(t.at) : '') + ' — untick and it goes, and the ' +
                 'chore stays due</div>' : '') +
+             (t.from_phone ? '<div class="why">added on your phone</div>' : '') +
              (t.carried_from ? '<div class="why">carried from ' + esc(t.carried_from) + '</div>' : '') +
              (t.blocked_on ? '<div class="why">⛔ ' + esc(t.blocked_on) + '</div>' : '') +
              '</div></label>';

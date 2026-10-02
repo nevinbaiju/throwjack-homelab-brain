@@ -115,7 +115,7 @@ with the task id from \`tasks.json\`:
     drop: t_1234567890ab
 
 Anything after the first line is kept as a note. \`done\` closes it, \`doing\`
-promotes it to In Progress, \`blocked\` moves it to Waiting, \`drop\` archives it.
+moves it onto Today, \`blocked\` moves it to Waiting, \`drop\` archives it.
 The id must match exactly; an unknown id is treated as an ordinary new capture,
 never guessed at. This is how you report work you actually finished — without
 it, nothing you do here can close a card.

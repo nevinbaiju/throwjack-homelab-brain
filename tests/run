@@ -8,7 +8,7 @@ for t in tests/test_validation.py tests/test_keys_and_retirement.py \
          tests/test_upkeep_due.py tests/test_upkeep_state.py \
          tests/test_upkeep_sweep.py tests/test_upkeep_plan.py \
          tests/test_upkeep_escalate.py tests/test_lane_removal.py \
-         tests/test_upkeep_migrate.py; do
+         tests/test_upkeep_migrate.py tests/test_adopt.py; do
   echo "== $t"
   python3 "$t" || rc=1
 done
