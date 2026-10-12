@@ -64,6 +64,16 @@
     opacity:0;transition:opacity .18s}
   #status.show{opacity:1}
   #status.err{color:var(--signal)}
+  #status .undo{pointer-events:auto;margin-left:4px;font-family:var(--mono);
+    font-size:11px;padding:2px 8px;cursor:pointer;background:var(--accent);
+    color:var(--accent-ink);border:0;border-radius:5px}
+  .acts .go{background:var(--accent);color:var(--accent-ink);border:0}
+  .acts .quiet{opacity:.65}
+  .acts .quiet:hover{opacity:1;color:var(--signal);border-color:var(--signal)}
+  details.ignored{margin:6px 0 2px;padding:0 4px}
+  details.ignored summary{font-family:var(--mono);font-size:11px;color:var(--ink-3);
+    cursor:pointer;padding:4px 0}
+  details.ignored .task .t{opacity:.7}
   #recent{border-top:1px solid var(--rule);padding-top:10px;margin:0;list-style:none;
     font-family:var(--mono);font-size:12px;color:var(--ink-3);
     max-height:22vh;overflow-y:auto}
@@ -251,7 +261,8 @@ for (const [name, id] of Object.entries(TABS)){
   else console.warn('tab button missing:', id);
 }
 
-const LANE_LABEL = {today:'Today', backlog:'Backlog', waiting:'Waiting', done:'Done'};
+const LANE_LABEL = {today:'Today', homelab:'Homelab Backlog', backlog:'Backlog',
+                    waiting:'Waiting', done:'Done'};
 
 function esc(t){ const d = document.createElement('div'); d.textContent = t == null ? '' : t; return d.innerHTML; }
 
@@ -691,13 +702,24 @@ function renderBoard(data){
     if (!items.length) out.push('<li class="empty">nothing here</li>');
     for (const t of items){
       const isDone = lane === 'done';
+      const isQueue = lane === 'homelab';
       out.push(
         '<li class="task' + (t.pinned ? ' pin' : '') + (isDone ? ' done-row' : '') + '" data-id="' + esc(t.id) + '">' +
-          '<input class="tick" type="checkbox" ' + (isDone ? 'checked disabled' : '') +
-            ' aria-label="complete ' + esc(t.title) + '">' +
+          // No tick in the review queue: these are not things you do, they are
+          // things you decide about. The two buttons are the only actions.
+          (isQueue ? '' :
+            '<input class="tick" type="checkbox" ' + (isDone ? 'checked disabled' : '') +
+            ' aria-label="complete ' + esc(t.title) + '">') +
           '<div class="body"><div class="t">' + esc(t.title) + '</div>' +
             '<div class="meta">' + metaLine(t) + '</div></div>' +
-          (isDone ? '' :
+          (isDone ? '' : isQueue ?
+            // Promote first and emphasised; ignore quieter and to the right, so
+            // the destructive one is not the one your thumb lands on. No confirm
+            // dialog -- undo is better than a prompt you learn to click through.
+            '<div class="acts">' +
+              '<button class="go" data-hl="promote" title="move it into Backlog">promote</button>' +
+              '<button class="quiet" data-hl="ignore" title="archive it; undoable">ignore</button>' +
+            '</div>' :
             '<div class="acts">' +
               (lane === 'today' ? '' : '<button data-verb="doing" title="move onto Today">today</button>') +
               (lane === 'waiting' ? '' : '<button data-verb="blocked" title="move to Waiting">wait</button>') +
@@ -705,9 +727,42 @@ function renderBoard(data){
             '</div>') +
         '</li>');
     }
-    out.push('</ul></section>');
+    out.push('</ul>');
+    // The standing undo. A misclick at 11pm should be recoverable the next
+    // morning, not for the six seconds a toast lives.
+    if (lane === 'homelab' && (data.ignored || []).length){
+      out.push('<details class="ignored"><summary>Recently ignored (' +
+               data.ignored.length + ')</summary><ul>');
+      for (const t of data.ignored){
+        out.push('<li class="task" data-id="' + esc(t.id) + '">' +
+          '<div class="body"><div class="t">' + esc(t.title) + '</div>' +
+          '<div class="meta">' + esc((t.at || '').slice(0,16).replace('T',' ')) + '</div></div>' +
+          '<div class="acts"><button data-hl="restore" title="put it back in the queue">' +
+          'restore</button></div></li>');
+      }
+      out.push('</ul></details>');
+    }
+    out.push('</section>');
   }
   $('board').innerHTML = out.join('');
+
+  $('board').querySelectorAll('[data-hl]').forEach(b => {
+    const li = b.closest('.task');
+    b.onclick = async () => {
+      const id = li.dataset.id, what = b.dataset.hl;
+      const title = (li.querySelector('.t') || {}).textContent || id;
+      b.disabled = true;
+      try{
+        const r = await fetch('/homelab/' + encodeURIComponent(id) + '/' + what,
+                              {method:'POST', headers:H});
+        if(!r.ok){ const d = await r.json().catch(()=>({})); throw new Error(d.detail || r.status); }
+        if (what === 'ignore') sayUndo('ignored “' + title + '”', id);
+        else say(what === 'promote' ? 'promoted to Backlog' : 'restored');
+        CACHE.board = null;                 // force a re-render, not a diff
+        loadBoard();
+      }catch(e){ b.disabled = false; say(e.message, true); }
+    };
+  });
 
   $('board').querySelectorAll('.task').forEach(li => {
     const id = li.dataset.id;
@@ -715,6 +770,33 @@ function renderBoard(data){
     if (tick && !tick.disabled) tick.onchange = () => tick.checked && act(id, 'done', li);
     li.querySelectorAll('.acts button').forEach(b => { b.onclick = () => act(id, b.dataset.verb, li); });
   });
+}
+
+// A toast with an Undo in it. The durable safety net is the "Recently ignored"
+// list; this is just the fast path for the click you regret immediately.
+function sayUndo(msg, taskId){
+  const s = $('status');
+  s.classList.remove('err');
+  s.textContent = msg + ' ';
+  const b = document.createElement('button');
+  b.textContent = 'Undo';
+  b.className = 'undo';
+  b.onclick = async () => {
+    b.disabled = true;
+    try{
+      const r = await fetch('/homelab/' + encodeURIComponent(taskId) + '/restore',
+                            {method:'POST', headers:H});
+      if(!r.ok) throw new Error((await r.json().catch(()=>({}))).detail || r.status);
+      say('put back');
+      CACHE.board = null;
+      loadBoard();
+    }catch(e){ say(e.message, true); }
+  };
+  s.appendChild(b);
+  s.classList.add('show');
+  clearTimeout(say.t);
+  // Longer than an ordinary toast, because this one is interactive.
+  say.t = setTimeout(() => s.classList.remove('show'), 9000);
 }
 
 function say(msg, bad){

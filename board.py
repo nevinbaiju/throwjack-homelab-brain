@@ -51,8 +51,30 @@ LANES: dict[str, tuple[str, str]] = {
 LANE_ALIASES = {"waiting": "backlog", "upkeep": "backlog", "in_progress": "today"}
 
 
-def collection_for(lane: str) -> str:
-    return LANES[LANE_ALIASES.get(lane, lane)][0]
+# Lanes the brain tracks but deliberately does NOT project onto the phone.
+#
+# `homelab` is a review queue: one item per Claude session's loose ends, written
+# by bin/brain-followups. They are unreviewed machine output, and pushing them to
+# Reminders before they have been looked at is precisely the noise this system
+# exists to suppress -- "track everything, surface a little". Promoting one is
+# what puts it on the phone.
+#
+# This has to be explicit rather than just absent from LANES, because audit()
+# walks EVERY active row and rescore_and_sync() pushes whatever does not match a
+# card. Without the guards below, the first item filed here would have reported
+# as "missing from the board", been pushed, and raised KeyError out of
+# collection_for() -- which no `except caldav.CalDavError` catches, so it would
+# have killed reconcile, the inbox drain and triage outright. That exact crash
+# has now been designed around three times (upkeep, in_progress, this).
+OFF_BOARD = {"homelab"}
+
+
+def collection_for(lane: str) -> str | None:
+    """The collection a lane projects into, or None if it is off-board."""
+    key = LANE_ALIASES.get(lane, lane)
+    if key in OFF_BOARD:
+        return None
+    return LANES[key][0]
 
 
 def same_lane(db_lane: str, collection_lane: str) -> bool:
@@ -99,6 +121,13 @@ def _priority(score: float) -> int:
 def write_task(conn, row, *, alarm_at: datetime | None = None) -> None:
     """Create or update a task's item in its lane. Moves it if the lane changed."""
     collection = collection_for(row["lane"])
+    if collection is None:
+        # Off-board lane. If it carries a card from an earlier lane, take it off:
+        # moving a task INTO the review queue has to remove it from the phone, or
+        # the card becomes an orphan nothing audits.
+        if row["caldav_collection"]:
+            remove_task(conn, row)
+        return
     body = []
     if row["lane"] == "waiting":
         body.append(f"waiting on {row['blocked_on']}" if row["blocked_on"] else "waiting on someone")
@@ -215,6 +244,8 @@ def audit(conn) -> list[dict]:
     now = datetime.now()
     out = []
     for row in store.active_tasks(conn):
+        if row["lane"] in OFF_BOARD:
+            continue                   # never projected, so never "missing"
         # You swiped this away, so reconcile cleared its collection and set
         # dismissed_until. Without this check the audit reports it as "missing
         # from the board", rescore_and_sync re-pushes it, and the card is back

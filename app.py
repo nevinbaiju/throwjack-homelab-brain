@@ -401,6 +401,186 @@ async def project_status(slug: str, authorization: str | None = Header(default=N
         conn.close()
 
 
+HOMELAB_LANE = "homelab"
+IGNORED_WINDOW_DAYS = 7
+IGNORED_SHOWN = 10
+
+
+@app.post("/homelab")
+async def homelab_add(request: Request,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """File a loose end into the Homelab Backlog review queue.
+
+    Deliberately NOT /capture. These arrive already written by the agent that
+    read the conversation, so there is nothing for triage to classify and its
+    title rule would rewrite the sentence. No model call, no inbox file, no
+    rewriting -- a direct insert into an off-board lane.
+
+    Idempotent on `key`: the follow-ups timer re-reads a conversation every 30
+    minutes, so the same loose end WILL be posted more than once. A repost
+    updates the title and note of the existing row rather than making a twin.
+
+    Body: JSON {title, note?, key?, track?} or plain text whose first line is
+    the title and the rest the note.
+    """
+    _require_auth(authorization, session)
+    import store
+
+    title = note = key = ""
+    track = "focus"
+    # The established value for this producer. Kept so anything already keyed on
+    # it keeps working; overridable for a different filer.
+    source = "claude-followup"
+    ctype = (request.headers.get("content-type") or "").lower()
+    if "json" in ctype:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="body must be a JSON object")
+        title = str(payload.get("title") or "").strip()
+        note = str(payload.get("note") or "").strip()
+        key = str(payload.get("key") or "").strip()
+        track = str(payload.get("track") or "focus").strip() or "focus"
+        source = str(payload.get("source") or source).strip() or source
+    else:
+        raw = (await request.body()).decode("utf-8", errors="replace")
+        head, _, rest = raw.strip().partition("\n")
+        title, note = head.strip(), rest.strip()
+
+    if not title:
+        raise HTTPException(status_code=400, detail="a title is required")
+    if track not in store.TRACKS:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown track {track!r} (have: {', '.join(store.TRACKS)})")
+    title, note = title[:200], note[:2000]
+
+    conn = store.connect()
+    try:
+        source_key = f"homelab:{key}" if key else None
+        existing = None
+        if source_key:
+            # include archived: re-posting something you IGNORED must not bring it
+            # back. You already made that decision; the agent does not get to
+            # overrule it every thirty minutes.
+            existing = conn.execute("SELECT * FROM tasks WHERE source_key=?",
+                                    (source_key,)).fetchone()
+        if existing is not None:
+            if existing["archived"]:
+                return {"ok": True, "id": existing["id"], "ignored": True,
+                        "note": "you ignored this; not re-filed"}
+            conn.execute("UPDATE tasks SET title=?, note=?, updated_at=? WHERE id=?",
+                         (title, note, store.now_iso(), existing["id"]))
+            conn.commit()
+            return {"ok": True, "id": existing["id"], "updated": True,
+                    "capture": existing["capture_id"]}
+
+        task_id = store.create_task(conn, title=title, note=note, track=track,
+                                    lane=HOMELAB_LANE, consequence="improves")
+        # A provenance capture, already closed. The follow-ups agent keys its
+        # state file on capture ids and archives tasks by capture_id, so one is
+        # written to keep that working -- state 'done' so triage never sees it.
+        cid = f"c_{store.secrets.token_hex(6)}"
+        store.ingest_capture(conn, {
+            "id": cid, "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "local": store.now_iso(), "source": source,
+            "text": title + (("\n" + note) if note else "")})
+        # Order matters and was wrong here: task_id=? took `cid` and WHERE id=?
+        # took the task id, so the UPDATE matched nothing. The capture stayed
+        # state='new' with a NULL task_id, which means triage would have run the
+        # model on it and created a SECOND task with a rewritten title -- the one
+        # thing this endpoint exists to avoid.
+        conn.execute("UPDATE captures SET state='done', task_id=? WHERE id=?", (task_id, cid))
+        conn.execute("UPDATE tasks SET capture_id=?, source_key=? WHERE id=?",
+                     (cid, source_key, task_id))
+        conn.commit()
+        return {"ok": True, "id": task_id, "capture": cid}
+    finally:
+        conn.close()
+
+
+def _homelab_row(conn, task_id: str, *, archived: int | None = None):
+    sql = "SELECT * FROM tasks WHERE id=?"
+    params: tuple = (task_id,)
+    row = conn.execute(sql, params).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="no such item")
+    if archived is not None and row["archived"] != archived:
+        raise HTTPException(status_code=409, detail="item is not in that state")
+    return row
+
+
+@app.post("/homelab/{task_id}/promote")
+async def homelab_promote(task_id: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Accept a loose end: it becomes an ordinary Backlog task and gets a card."""
+    _require_auth(authorization, session)
+    import board as bd, caldav, store
+    conn = store.connect()
+    try:
+        row = _homelab_row(conn, task_id, archived=0)
+        ts = store.now_iso()
+        conn.execute("UPDATE tasks SET lane='backlog', touched_at=?, updated_at=? WHERE id=?",
+                     (ts, ts, task_id))
+        conn.commit()
+        fresh = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        try:
+            bd.write_task(conn, fresh)
+        except caldav.CalDavError as e:
+            # The lane move stands; the next audit retries the push. Reporting it
+            # beats rolling back a decision you made.
+            print(f"[homelab] promoted {task_id} but could not push: {e}", flush=True)
+        conn.commit()
+        return {"ok": True, "id": task_id, "lane": "backlog", "title": row["title"]}
+    finally:
+        conn.close()
+
+
+@app.post("/homelab/{task_id}/ignore")
+async def homelab_ignore(task_id: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Decline a loose end. Archived, never deleted, and always restorable."""
+    _require_auth(authorization, session)
+    import board as bd, store
+    conn = store.connect()
+    try:
+        row = _homelab_row(conn, task_id, archived=0)
+        conn.execute("UPDATE tasks SET archived=1, updated_at=? WHERE id=?",
+                     (store.now_iso(), task_id))
+        bd.remove_task(conn, row)        # no-op for an off-board lane, but cheap
+        conn.commit()
+        return {"ok": True, "id": task_id, "title": row["title"], "undo": True}
+    finally:
+        conn.close()
+
+
+@app.post("/homelab/{task_id}/restore")
+async def homelab_restore(task_id: str,
+        authorization: str | None = Header(default=None),
+        session: str | None = Cookie(default=None, alias=auth.COOKIE)):
+    """Undo an ignore. Puts it back in the queue, not in the backlog.
+
+    Undo has to be reachable long after the click: a misclick at 11pm should be
+    recoverable the next morning, not for six seconds. So ignoring writes the
+    decision down immediately and the UI keeps a standing "recently ignored"
+    list, rather than holding the request back behind a countdown.
+    """
+    _require_auth(authorization, session)
+    import store
+    conn = store.connect()
+    try:
+        row = _homelab_row(conn, task_id, archived=1)
+        ts = store.now_iso()
+        conn.execute("UPDATE tasks SET archived=0, lane=?, status='needs_action',"
+                     " completed_at=NULL, touched_at=?, updated_at=? WHERE id=?",
+                     (HOMELAB_LANE, ts, ts, task_id))
+        conn.commit()
+        return {"ok": True, "id": task_id, "title": row["title"], "lane": HOMELAB_LANE}
+    finally:
+        conn.close()
+
+
 @app.get("/board.json")
 async def board_json(authorization: str | None = Header(default=None),
         session: str | None = Cookie(default=None, alias=auth.COOKIE)):
@@ -430,8 +610,21 @@ async def board_json(authorization: str | None = Header(default=None),
                 "priority": bd._priority(r["score"] or 0.0),
                 "pinned": pinned, "status": r["status"],
             })
-        return {"lanes": lanes,
-                "order": ["today", "backlog", "waiting", "done"]}
+        # Recently ignored, so an unintended click stays recoverable long after
+        # the toast has gone. Bounded by age and count: this is an undo affordance,
+        # not an archive browser.
+        from datetime import timedelta as _td
+        cutoff = (store.datetime.now() - _td(days=IGNORED_WINDOW_DAYS)).isoformat(
+            timespec="seconds")
+        ignored = [
+            {"id": r["id"], "title": r["title"],
+             "why": r["why"] or r["note"] or "", "at": r["updated_at"]}
+            for r in conn.execute(
+                "SELECT * FROM tasks WHERE archived=1 AND lane=? AND updated_at >= ?"
+                " ORDER BY updated_at DESC LIMIT ?",
+                (HOMELAB_LANE, cutoff, IGNORED_SHOWN))]
+        return {"lanes": lanes, "ignored": ignored,
+                "order": ["today", "homelab", "backlog", "waiting", "done"]}
     finally:
         conn.close()
 

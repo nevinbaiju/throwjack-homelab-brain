@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+"""File what each Claude Code conversation left open into the brain's Backlog.
+
+A conversation counts as over once its transcript has been quiet for
+QUIET_HOURS. Claude reads it with no tools -- what was typed and what Claude
+said, never tool output -- and lists the loose ends: a decision it asked for and
+never got, work that stopped partway, a step only you can do, a check for later.
+Each one is posted to /capture like anything else you capture, so triage files
+it into Backlog and the brain's own dedupe applies.
+
+    brain-followups run             what the timer runs: every conversation that
+                                    has gone quiet since it last looked
+    brain-followups dry [DAYS|ID..] print what `run` would file and keep the list,
+                                    filing nothing. DAYS re-reads every quiet
+                                    conversation from the last DAYS days; ID
+                                    prefixes read just those, quiet or not
+    brain-followups apply [N ..]    file the kept list exactly as printed, except
+                                    items N .., which stay out: later reads of any
+                                    conversation count them as handled
+    brain-followups undo all|c_..   archive the open tasks it created
+
+It never edits, moves or closes a task: tick it when it is done. Its state in
+BRAIN_DATA/followups/ is how far each transcript has been read, what each
+conversation produced and what you left out. If that is lost, the next run
+starts from now, so nothing is ever filed twice.
+"""
+from __future__ import annotations
+
+import contextlib
+import copy
+import fcntl
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+HOME = os.path.expanduser("~")
+
+
+def _dotenv(key: str) -> str:
+    """A value from the repo's .env, the same file brain.sh takes its token from."""
+    try:
+        with open(os.path.join(REPO, ".env")) as f:
+            for line in f:
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+BRAIN = (os.environ.get("BRAIN_URL") or "http://127.0.0.1:5010").rstrip("/")
+TOKEN = os.environ.get("BRAIN_TOKEN") or _dotenv("BRAIN_TOKEN")
+DATA = os.environ.get("BRAIN_DATA") or _dotenv("BRAIN_DATA") or "/var/mnt/storage/brain"
+STATE_DIR = os.path.join(DATA, "followups")
+STATE = os.path.join(STATE_DIR, "state.json")
+PLAN = os.path.join(STATE_DIR, "plan.json")
+PROJECTS = os.environ.get("CLAUDE_PROJECTS") or f"{HOME}/.claude/projects"
+CLAUDE = os.environ.get("CLAUDE_BIN") or f"{HOME}/.local/bin/claude"
+MODEL = os.environ.get("FOLLOWUPS_MODEL") or "sonnet"
+QUIET_HOURS = float(os.environ.get("FOLLOWUPS_QUIET_HOURS") or 2)
+SOURCE = "claude-followup"
+BUDGET = 120_000          # characters of conversation per read, roughly 30k tokens
+PER_MESSAGE = 8_000
+MAX_ITEMS = 6
+MIN_FREE_GB = 2           # the box froze from memory exhaustion once already
+GIVE_UP = 3               # failed reads of one conversation before skipping it
+NO_MCP = '{"mcpServers":{}}'
+
+SYSTEM = """You read one conversation between a person and Claude Code, held on \
+their home server, and list the loose ends it left them: what belongs on their \
+task list now that the conversation is over.
+
+A loose end is one of:
+- a decision or approval Claude asked for that never came
+- work that stopped partway: steps left, deferred, banked, or blocked on something
+- a step only the person can do: on their phone, with hardware, a login, a purchase, a message
+- a check to make later, such as after a reboot or once something has run for a while
+- a risk Claude flagged for their decision that they have not answered
+
+Leave out:
+- anything finished, answered or declined later in the conversation
+- suggestions they showed no interest in, and general advice
+- Claude's own next steps that it then carried out
+- anything the notes or the already-handled lists cover, however it is worded
+
+Most conversations leave nothing, or one to three things. A question that got its \
+answer leaves nothing. An empty list is a normal answer.
+
+For each loose end:
+- title: the next physical action, for the person, starting with a verb. Under 80 \
+characters, and specific enough to start on without rereading anything. Never \
+start with "Work" or with "P0" to "P3".
+- context: one or two sentences: where it stands and what picking it up involves. \
+Mention a date only if it is a deadline still ahead. Never include a password, \
+token, key or PIN.
+- consequence: what happens if it is never done. "breaks": something stops \
+working, data is lost or left unprotected, or a deadline passes. "costs": money, \
+rework or a worse outcome, but nothing breaks. "improves": better if done, \
+nothing bad if not. "optional": nice to have. Most loose ends improve things; \
+keep "breaks" for real breakage."""
+
+# Sent as the P-level prefix triage parses in Python (triage.split_priority),
+# so the rating comes from a model that read the whole conversation rather than
+# from triage guessing at three lines: left to triage, 17 of the first 43
+# backfill items came back "breaks" and would all have shown as !!!.
+CONSEQUENCE = {"breaks": 1, "costs": 2, "improves": 3, "optional": 3}
+
+SCHEMA = {
+    "type": "object", "additionalProperties": False, "required": ["items"],
+    "properties": {"items": {"type": "array", "maxItems": MAX_ITEMS, "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["title", "context", "consequence"],
+        "properties": {"title": {"type": "string"}, "context": {"type": "string"},
+                       "consequence": {"type": "string", "enum": list(CONSEQUENCE)}}}}},
+}
+
+# Wrappers the harness puts around things nobody typed. A paste is kept: the
+# tag goes, the text is what the person sent.
+_REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+_PASTE = re.compile(r"</?pasted_content[^>]*>")
+_HARNESS = re.compile(r"^\s*<(command-|local-command-|task-notification)")
+
+# Triage reads a leading "work"/"w:" as the meta track and a leading P0-P3 as a
+# priority you set yourself (triage.py). Neither is true of a follow-up.
+_ROUTING = re.compile(
+    r"^\s*(?:p\s*[0-3]\b|w\s*[:\-]|(?:for\s+)?work\s*[:\-]|(?:this\s+is\s+)?(?:my\s+)?work\b)",
+    re.IGNORECASE)
+
+
+def die(msg: str):
+    sys.exit(f"brain-followups: {msg}")
+
+
+# --- transcripts ------------------------------------------------------------
+
+def transcripts():
+    """Every session transcript, except one-shot calls made from a scratch dir."""
+    for path in glob.glob(f"{PROJECTS}/*/*.jsonl"):
+        if not os.path.basename(os.path.dirname(path)).startswith("-tmp-"):
+            yield path
+
+
+def _text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+        return ""
+    return "\n".join(b.get("text", "") for b in content
+                     if isinstance(b, dict) and b.get("type") == "text")
+
+
+def _day(ts: str | None) -> str | None:
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    except (AttributeError, ValueError):
+        return None
+
+
+def read(path: str) -> dict:
+    """One transcript: who and where, plus the conversation as (who, text) pairs,
+    oldest first. Only what was typed and what Claude said: that is where loose
+    ends get stated, and it is a fraction of the size of the tool traffic."""
+    c = {"id": os.path.basename(path)[:-6], "path": path, "size": os.path.getsize(path),
+         "mtime": os.path.getmtime(path), "cwd": None, "name": None, "title": None,
+         "prompt": None, "first": None, "last": None, "turns": 0, "msgs": []}
+    with open(path, errors="replace") as f:
+        for line in f:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            kind = r.get("type")
+            if kind == "ai-title":
+                c["title"] = r.get("aiTitle") or c["title"]
+            elif kind in ("agent-name", "custom-title"):
+                c["name"] = r.get("agentName") or r.get("customTitle") or c["name"]
+            if kind not in ("user", "assistant") or r.get("isSidechain"):
+                continue
+            c["cwd"] = c["cwd"] or r.get("cwd")
+            day = _day(r.get("timestamp"))
+            c["first"], c["last"] = c["first"] or day, day or c["last"]
+            text = _text((r.get("message") or {}).get("content")).strip()
+            if kind == "assistant":
+                if text:
+                    c["msgs"].append(("claude", text))
+                    c["turns"] += 1
+                continue
+            if r.get("isMeta") or "toolUseResult" in r:
+                continue
+            if r.get("isCompactSummary"):
+                # It already says everything before it, better than any cut would.
+                c["msgs"] = [("summary", text)]
+                c["turns"] += 1
+                continue
+            text = _PASTE.sub("", _REMINDER.sub("", text)).strip()
+            if text and not _HARNESS.match(text):
+                c["prompt"] = c["prompt"] or text
+                c["msgs"].append(("user", text))
+                c["turns"] += 1
+    return c
+
+
+def is_conversation(c: dict) -> bool:
+    """Someone typed in it. The brain's planner runs are not conversations: their
+    prompt is a JSON payload."""
+    return bool(c["prompt"]) and not c["prompt"].startswith("{")
+
+
+def label(c: dict) -> str:
+    return c.get("title") or c.get("name") or c["id"][:8]
+
+
+def render(c: dict) -> str:
+    """The conversation as text, cut to BUDGET by dropping the middle: the start
+    says what it was for, and the end says what was left, which is the point."""
+    tags = {"user": "USER", "claude": "CLAUDE", "summary": "SUMMARY OF THE EARLIER PART"}
+    parts = []
+    for who, text in c["msgs"]:
+        if len(text) > PER_MESSAGE:
+            text = f"{text[:PER_MESSAGE // 2]}\n[...]\n{text[-PER_MESSAGE // 2:]}"
+        parts.append(f"{tags[who]}: {text}")
+    if not parts:
+        return ""
+    room, tail = BUDGET - len(parts[0]), []
+    for p in reversed(parts[1:]):
+        if len(p) > room:
+            break
+        tail.append(p)
+        room -= len(p)
+    tail.reverse()
+    gap = len(parts) - 1 - len(tail)
+    return "\n\n".join([parts[0], *([f"[... {gap} messages left out ...]"] if gap else []), *tail])
+
+
+def busy() -> set[str]:
+    """Sessions working right now. A quiet transcript can still be mid-task: a
+    long tool call writes nothing until it returns."""
+    try:
+        out = subprocess.run([CLAUDE, "agents", "--json"], capture_output=True,
+                             text=True, timeout=30).stdout
+        return {a["sessionId"] for a in json.loads(out or "[]") if a.get("status") == "busy"}
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        return set()
+
+
+def due(state: dict, days: float | None = None, ids: tuple = ()) -> list[dict]:
+    """Conversations to read now, newest first, one per session.
+
+    Normally: quiet for QUIET_HOURS and grown since last read. `days` takes every
+    quiet one active in that window, read or not; `ids` takes just those."""
+    now, working, by_id = time.time(), busy(), {}
+    for path in transcripts():
+        sid, size, mtime = os.path.basename(path)[:-6], os.path.getsize(path), os.path.getmtime(path)
+        if sid in working:
+            continue
+        if ids:
+            if not any(sid.startswith(i) for i in ids):
+                continue
+        elif mtime > now - QUIET_HOURS * 3600:
+            continue
+        elif days is not None:
+            if mtime < now - days * 86400:
+                continue
+        elif size <= state["read"].get(path, {}).get("size", 0):
+            continue
+        by_id.setdefault(sid, {})[path] = size
+    out = []
+    # One session can sit in two project dirs when it was resumed from another
+    # directory. Read the newest copy; count every copy as read.
+    for sizes in by_id.values():
+        c = read(max(sizes, key=os.path.getmtime))
+        c["sizes"] = sizes
+        out.append(c)
+    return sorted(out, key=lambda c: -c["mtime"])
+
+
+# --- state ------------------------------------------------------------------
+
+def load() -> dict | None:
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
+def save(state: dict) -> None:
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def fresh(before: float) -> dict:
+    """State for a first run, or for one whose state was lost: every transcript
+    last touched before `before` counts as read, so the timer starts from now
+    rather than filing a month of history nobody looked at. A conversation still
+    going is left out of it, and is filed when it ends like any other."""
+    return {"read": {p: {"size": os.path.getsize(p), "turns": None} for p in transcripts()
+                     if os.path.getmtime(p) < before},
+            "filed": {}, "left_out": {}, "failed": {}}
+
+
+def mark(state: dict, c: dict) -> None:
+    for path, size in c["sizes"].items():
+        state["read"][path] = {"size": size, "turns": c["turns"]}
+    state["failed"].pop(c["id"], None)
+
+
+def unchanged(state: dict, c: dict) -> bool:
+    """The transcript grew but the conversation did not: a rename or a resume
+    that was never typed into appends lines too."""
+    return state["read"].get(c["path"], {}).get("turns") == c["turns"]
+
+
+def filed(state: dict, c: dict, item: dict, capture: str) -> None:
+    state["filed"].setdefault(c["id"], []).append(
+        {"capture": capture, "title": item["title"],
+         "at": datetime.now().isoformat(timespec="seconds")})
+
+
+def left_out(state: dict, c: dict, item: dict) -> None:
+    """A loose end you chose not to file. It counts as handled from then on, or
+    the next read of a conversation that mentions it would file it anyway."""
+    out = state.setdefault("left_out", {}).setdefault(c["id"], [])
+    if all(o["title"] != item["title"] for o in out):
+        out.append({"title": item["title"], "at": datetime.now().isoformat(timespec="seconds")})
+
+
+@contextlib.contextmanager
+def lock():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, ".lock"), "w") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
+# --- reading a conversation -------------------------------------------------
+
+def _memory(c: dict) -> str:
+    """The memory index of the session's own project: newer than most of what is
+    in the conversation, so it says which loose ends were tied up later."""
+    try:
+        with open(os.path.join(os.path.dirname(c["path"]), "memory", "MEMORY.md")) as f:
+            return f.read(8000).strip()
+    except OSError:
+        return ""
+
+
+def already(state: dict, c: dict) -> tuple[list[str], list[str]]:
+    """Titles filed or left out: from this conversation, and from others in the
+    last 30 days. Oldest first."""
+    since = (datetime.now() - timedelta(days=30)).isoformat()
+    mine, others = [], []
+    for kind in ("filed", "left_out"):
+        for sid, fs in state.get(kind, {}).items():
+            for f in fs:
+                if sid == c["id"]:
+                    mine.append((f["at"], f["title"]))
+                elif f["at"] >= since:
+                    others.append((f["at"], f["title"]))
+    return [t for _, t in sorted(mine)], [t for _, t in sorted(others)]
+
+
+def _norm(title: str) -> str:
+    return " ".join(title.lower().split()).strip(" .!?")      # store.normalise_title
+
+
+def prompt(c: dict, state: dict) -> str:
+    mine, others = already(state, c)
+
+    def bullets(xs):
+        return "\n".join(f"- {x}" for x in xs) or "(none)"
+
+    return (
+        f"Today is {datetime.now():%Y-%m-%d}. The conversation is \"{label(c)}\", "
+        f"{c['first']} to {c['last']}, working in {c['cwd'] or 'an unknown directory'}.\n\n"
+        "Notes this server's Claude sessions keep. They are newer than most of the "
+        "conversation: use them only to leave out loose ends they show are settled, and "
+        f"never file anything from the notes themselves.\n{_memory(c) or '(none)'}\n\n"
+        f"Already filed or left out, from this conversation:\n{bullets(mine)}\n\n"
+        f"Already filed or left out, from other conversations:\n{bullets(others[-100:])}\n\n"
+        f"<conversation>\n{render(c)}\n</conversation>")
+
+
+def clean(items, seen: list[str] = ()) -> list[dict]:
+    """The model proposes, code decides: one line each, bounded, routed right,
+    and never a title already filed, whatever the model was told."""
+    out, seen = [], {_norm(t) for t in seen}
+    for it in (items or [])[:MAX_ITEMS]:
+        if not isinstance(it, dict):
+            continue
+        title = " ".join(str(it.get("title", "")).split())[:120]
+        context = " ".join(str(it.get("context", "")).split())[:600]
+        if len(title) < 4:
+            continue
+        if _ROUTING.match(title):
+            title = "Follow up: " + title
+        if _norm(title) in seen:
+            continue
+        seen.add(_norm(title))
+        consequence = it.get("consequence") if it.get("consequence") in CONSEQUENCE else "improves"
+        out.append({"title": title, "context": context, "consequence": consequence})
+    return out
+
+
+def ask(c: dict, state: dict) -> list:
+    """What the model proposes for one conversation. Raises on anything but a
+    clean answer."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    # The conversation goes in on stdin: one argv string is capped at 128 KiB.
+    p = subprocess.run(
+        [CLAUDE, "-p", "--model", MODEL, "--system-prompt", SYSTEM, "--tools", "",
+         "--strict-mcp-config", "--mcp-config", NO_MCP, "--no-session-persistence",
+         "--json-schema", json.dumps(SCHEMA), "--output-format", "json"],
+        input=prompt(c, state), capture_output=True, text=True, timeout=900, cwd=STATE_DIR)
+    if p.returncode != 0:
+        raise RuntimeError(f"claude exited {p.returncode}: {(p.stderr or p.stdout)[-300:]}")
+    env = json.loads(p.stdout)
+    out = env.get("structured_output")
+    if env.get("is_error") or not isinstance(out, dict) or not isinstance(out.get("items"), list):
+        raise RuntimeError(f"no usable answer: {str(env.get('result'))[:300]}")
+    return out["items"]
+
+
+def extract(c: dict, state: dict) -> list[dict]:
+    """The loose ends in one conversation, as they will be filed."""
+    return clean(ask(c, state), sum(already(state, c), []))
+
+
+def capture_text(item: dict, c: dict) -> str:
+    where = f"cd {c['cwd']} && " if c.get("cwd") else ""
+    level = CONSEQUENCE.get(item.get("consequence"), 3)
+    return (f"P{level}: {item['title']}\n{item['context']}\n"
+            f"From the Claude Code conversation \"{label(c)}\" ({c['id'][:8]}). "
+            f"Pick it up with: {where}claude --resume {c['id']}")
+
+
+def enough_ram() -> bool:
+    with open("/proc/meminfo") as f:
+        kb = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable:"))
+    return kb / 2**20 >= MIN_FREE_GB
+
+
+# --- the brain --------------------------------------------------------------
+
+def _api(path: str, payload: dict | None = None) -> dict:
+    req = urllib.request.Request(
+        f"{BRAIN}{path}", method="POST",
+        data=json.dumps(payload or {}).encode(),
+        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json",
+                 "X-Source": SOURCE, "User-Agent": "brain-followups/1"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        body = r.read()
+    return json.loads(body) if body.strip() else {}
+
+
+def post(text: str, c: dict) -> str:
+    cid = _api("/capture", {"text": text, "session": c["id"]}).get("id")
+    if not cid:
+        raise RuntimeError("the brain took the capture but returned no id")
+    return cid
+
+
+# --- commands ---------------------------------------------------------------
+
+def run() -> int:
+    if not TOKEN:
+        die("no BRAIN_TOKEN in the environment or in .env")
+    with lock():
+        state = load()
+        if state is None:
+            save(fresh(time.time() - QUIET_HOURS * 3600))
+            print("first run: every conversation that has already ended counts as read")
+            return 0
+        gave_up = 0
+        for c in due(state):
+            if not is_conversation(c) or unchanged(state, c):
+                mark(state, c)
+                save(state)
+                continue
+            if not enough_ram():
+                print(f"under {MIN_FREE_GB} GB of RAM free; the rest waits for the next run")
+                break
+            try:
+                items = extract(c, state)
+            except (RuntimeError, ValueError, subprocess.SubprocessError) as e:
+                n = state["failed"][c["id"]] = state["failed"].get(c["id"], 0) + 1
+                print(f"{label(c)}: {e} (attempt {n})", file=sys.stderr)
+                if n >= GIVE_UP:
+                    gave_up += 1
+                    print(f"{label(c)}: giving up until it changes again", file=sys.stderr)
+                    mark(state, c)
+                save(state)
+                continue
+            try:
+                for item in items:
+                    cid = post(capture_text(item, c), c)
+                    filed(state, c, item, cid)
+                    save(state)
+                    print(f"filed {cid}: {item['title']}  ({label(c)})")
+            except (urllib.error.URLError, OSError, RuntimeError) as e:
+                # The brain is down, not this conversation broken: no attempt is
+                # counted, and what was already filed is on the already-filed list
+                # the next read gets.
+                print(f"the brain did not take a capture: {e}", file=sys.stderr)
+                return 1
+            mark(state, c)
+            save(state)
+        # The exit status is what the dashboard alerts on (bin/homelab-status).
+        # A failed read is retried next tick, and one hiccup is not worth a
+        # page; giving up on a conversation is, because its loose ends are lost.
+        return 1 if gave_up else 0
+
+
+def dry(args: list[str]) -> int:
+    days = float(args[0]) if args and args[0].replace(".", "", 1).isdigit() else None
+    ids = tuple(a.lower() for a in args) if args and days is None else ()
+    with lock():
+        state = load()
+        if state is None and days is None and not ids:
+            print("The first run files nothing: every conversation that has ended counts as read.\n"
+                  "To see what a backfill would file: brain-followups dry DAYS")
+            return 0
+        # A scratch copy collects this list as it goes, so a loose end two
+        # conversations share is proposed once, from the newer one.
+        scratch = copy.deepcopy(state) if state else {"read": {}, "filed": {}, "failed": {}}
+        plan, n, failed = [], 0, 0
+        for c in due(scratch, days, ids):
+            if not is_conversation(c) or (days is None and not ids and unchanged(scratch, c)):
+                continue
+            if not enough_ram():
+                die(f"under {MIN_FREE_GB} GB of RAM free; stopping before the list is complete")
+            day = time.strftime("%m-%d", time.localtime(c["mtime"]))
+            try:
+                items = extract(c, scratch)
+            except (RuntimeError, ValueError, subprocess.SubprocessError) as e:
+                failed += 1
+                print(f"\n{c['id'][:8]}  {day}  {label(c)}\n   could not read: {e}", flush=True)
+                continue
+            print(f"\n{c['id'][:8]}  {day}  {label(c)}", flush=True)
+            for item in items:
+                n += 1
+                filed(scratch, c, item, f"#{n}")
+                print(f"  {n:>3}. P{CONSEQUENCE[item['consequence']]} {item['title']}"
+                      + (f"\n       {item['context']}" if item["context"] else ""), flush=True)
+            if not items:
+                print("       (nothing left open)", flush=True)
+            plan.append({k: c[k] for k in ("id", "path", "cwd", "name", "title", "turns", "sizes")}
+                        | {"items": items})
+        with open(PLAN, "w") as f:
+            json.dump({"made": time.time(), "days": days, "conversations": plan}, f, indent=1)
+        print(f"\n{n} items from {sum(1 for p in plan if p['items'])} of {len(plan)} conversations"
+              + (f"; {failed} could not be read" if failed else "")
+              + ". Nothing was filed. To file them: brain-followups apply [numbers to leave out]")
+        return 1 if failed else 0
+
+
+def apply(skip: set[int]) -> int:
+    if not TOKEN:
+        die("no BRAIN_TOKEN in the environment or in .env")
+    with lock():
+        try:
+            with open(PLAN) as f:
+                kept = json.load(f)
+            plan = kept["conversations"]
+        except FileNotFoundError:
+            die("no list to apply; run `brain-followups dry` first")
+        state = load()
+        if state is None:
+            # What the list deliberately left out counts as read, as on a first
+            # run, or the timer would go on to file all of it. That is anything
+            # older than its window; what was too recent to be on it is not, and
+            # is filed when it ends.
+            days = kept.get("days")
+            state = fresh(kept["made"] - (days * 86400 if days is not None else QUIET_HOURS * 3600))
+            for c in plan:
+                for path, size in c["sizes"].items():
+                    state["read"][path] = {"size": size, "turns": None}
+        n = 0
+        for c in plan:
+            # A rerun after the brain went down mid-list must not file twice.
+            done = {f["title"] for f in state["filed"].get(c["id"], [])}
+            for item in c["items"]:
+                n += 1
+                if n in skip:
+                    left_out(state, c, item)
+                    print(f"  {n:>3}. left out: {item['title']}")
+                    continue
+                if item["title"] in done:
+                    print(f"  {n:>3}. already filed: {item['title']}")
+                    continue
+                cid = post(capture_text(item, c), c)
+                filed(state, c, item, cid)
+                save(state)
+                print(f"  {n:>3}. filed {cid}: {item['title']}")
+            for path, size in c["sizes"].items():
+                if size >= state["read"].get(path, {}).get("size", 0):
+                    state["read"][path] = {"size": size, "turns": c["turns"]}
+            save(state)
+        os.replace(PLAN, f"{PLAN}.applied-{datetime.now():%Y%m%d-%H%M%S}")   # never twice
+        return 0
+
+
+def undo(which: list[str]) -> int:
+    """Archive the open tasks made from its own captures. A capture the brain
+    attached to a task you already had (its dedupe) points at YOUR task, whose
+    capture_id is someone else's, so that task is never touched."""
+    if not TOKEN:
+        die("no BRAIN_TOKEN in the environment or in .env")
+    with lock():
+        state = load() or die("nothing has been filed")
+        ours = {f["capture"] for fs in state["filed"].values() for f in fs}
+        wanted = sorted(ours if which == ["all"] else ours & set(which))
+        if not wanted:
+            die("none of those captures are ones it filed")
+        db = sqlite3.connect(f"file:{DATA}/state/brain.db?mode=ro", uri=True)
+        rows = db.execute(
+            "SELECT id, title FROM tasks WHERE archived=0 AND status!='completed' "
+            f"AND capture_id IN ({','.join('?' * len(wanted))})", wanted).fetchall()
+        db.close()
+        for tid, title in rows:
+            _api(f"/task/{tid}/drop")
+            print(f"archived {tid}: {title}")
+        print(f"{len(rows)} archived; {len(wanted) - len(rows)} of those captures are done, "
+              "already archived, or not triaged yet")
+        return 0
+
+
+def main(argv: list[str]) -> int:
+    cmd, args = (argv[0], argv[1:]) if argv else ("", [])
+    if cmd == "run" and not args:
+        return run()
+    if cmd == "dry":
+        return dry(args)
+    if cmd == "apply" and all(a.isdigit() for a in args):
+        return apply({int(a) for a in args})
+    if cmd == "undo" and args:
+        return undo(args)
+    sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

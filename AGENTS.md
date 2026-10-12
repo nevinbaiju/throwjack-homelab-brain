@@ -22,6 +22,9 @@ thought of the obvious one. Read "Design rules" before changing behaviour.
     policy.py    quiet hours
     store.py     SQLite — the system of record
     auth.py      scrypt password hashing, signed session cookies
+    bin/brain-planner    host side: runs the planning model on the host's Claude login
+    bin/brain-followups  host side: files what Claude Code conversations left open
+                         into the Homelab Backlog queue (POST /homelab)
 
 Apple Reminders is a *projection* of SQLite, never the source of truth.
 
@@ -83,6 +86,16 @@ Short version:
   it; the planner is the only thing that puts work on a day. `project.promote` was
   deleted rather than capped, because with Today as the active lane it would have
   overwritten the day's decision every ten minutes.
+- **A lane can be off-board.** `board.OFF_BOARD` lists lanes the brain tracks
+  but never projects to the phone. `homelab` is one: a review queue of loose ends
+  that `bin/brain-followups` files, which are unreviewed machine output — pushing
+  them to Reminders before they have been looked at is the noise this system
+  exists to suppress. Promoting one is what puts it on the phone. The guards are
+  not optional: `audit()` walks *every* active row and `rescore_and_sync()` pushes
+  whatever has no matching card, so a lane that is merely absent from `LANES`
+  makes the first item filed there raise `KeyError` out of `collection_for()` —
+  which no `except caldav.CalDavError` catches, so it kills reconcile, the inbox
+  drain and triage. That crash has now been designed around three times.
 - **A card you create on your phone becomes a task.** reconcile adopts any item
   in Today or Backlog whose uid matches no row, keeping the iPhone's own UUID as
   the task id. Triage then supplies track, consequence and project — never the
