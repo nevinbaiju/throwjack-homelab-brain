@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""File what each Claude Code conversation left open into the brain's Backlog.
+"""File what each Claude Code conversation left open into the brain's Homelab Backlog.
 
 A conversation counts as over once its transcript has been quiet for
 QUIET_HOURS. Claude reads it with no tools -- what was typed and what Claude
 said, never tool output -- and lists the loose ends: a decision it asked for and
 never got, work that stopped partway, a step only you can do, a check for later.
-Each one is posted to /capture like anything else you capture, so triage files
-it into Backlog and the brain's own dedupe applies.
+Each one is posted to /homelab as written, with no triage: it waits in the
+board's Homelab Backlog queue, off your phone, until you promote or ignore it.
 
     brain-followups run             what the timer runs: every conversation that
                                     has gone quiet since it last looked
@@ -30,6 +30,7 @@ import contextlib
 import copy
 import fcntl
 import glob
+import hashlib
 import json
 import os
 import re
@@ -108,10 +109,10 @@ rework or a worse outcome, but nothing breaks. "improves": better if done, \
 nothing bad if not. "optional": nice to have. Most loose ends improve things; \
 keep "breaks" for real breakage."""
 
-# Sent as the P-level prefix triage parses in Python (triage.split_priority),
-# so the rating comes from a model that read the whole conversation rather than
-# from triage guessing at three lines: left to triage, 17 of the first 43
-# backfill items came back "breaks" and would all have shown as !!!.
+# Sent as the item's consequence, which orders the queue and stays with a task
+# you promote, so the rating comes from a model that read the whole conversation.
+# Triage guessing at three lines rated 17 of the first 43 backfill items
+# "breaks", which would all have shown as !!!. The P-level is what dry prints.
 CONSEQUENCE = {"breaks": 1, "costs": 2, "improves": 3, "optional": 3}
 
 SCHEMA = {
@@ -439,12 +440,16 @@ def extract(c: dict, state: dict) -> list[dict]:
     return clean(ask(c, state), sum(already(state, c), []))
 
 
-def capture_text(item: dict, c: dict) -> str:
+def entry(item: dict, c: dict) -> dict:
     where = f"cd {c['cwd']} && " if c.get("cwd") else ""
-    level = CONSEQUENCE.get(item.get("consequence"), 3)
-    return (f"P{level}: {item['title']}\n{item['context']}\n"
-            f"From the Claude Code conversation \"{label(c)}\" ({c['id'][:8]}). "
-            f"Pick it up with: {where}claude --resume {c['id']}")
+    note = (f"{item['context']}\n" if item.get("context") else "") + (
+        f"From the Claude Code conversation \"{label(c)}\" ({c['id'][:8]}). "
+        f"Pick it up with: {where}claude --resume {c['id']}")
+    # The key makes a repost (say, after a crash before the state was saved)
+    # update the same row, and the brain refuses one you already ignored.
+    key = f"{c['id']}:{hashlib.sha1(_norm(item['title']).encode()).hexdigest()[:12]}"
+    return {"title": item["title"], "note": note, "key": key,
+            "consequence": item.get("consequence") or "improves"}
 
 
 def enough_ram() -> bool:
@@ -466,11 +471,14 @@ def _api(path: str, payload: dict | None = None) -> dict:
     return json.loads(body) if body.strip() else {}
 
 
-def post(text: str, c: dict) -> str:
-    cid = _api("/capture", {"text": text, "session": c["id"]}).get("id")
-    if not cid:
-        raise RuntimeError("the brain took the capture but returned no id")
-    return cid
+def post(e: dict) -> str | None:
+    """The capture id, or None when you already ignored this one on the board."""
+    out = _api("/homelab", e)
+    if out.get("ignored"):
+        return None
+    if not out.get("capture"):
+        raise RuntimeError("the brain took the item but returned no capture id")
+    return out["capture"]
 
 
 # --- commands ---------------------------------------------------------------
@@ -506,7 +514,12 @@ def run() -> int:
                 continue
             try:
                 for item in items:
-                    cid = post(capture_text(item, c), c)
+                    cid = post(entry(item, c))
+                    if cid is None:
+                        left_out(state, c, item)
+                        save(state)
+                        print(f"ignored on the board before: {item['title']}  ({label(c)})")
+                        continue
                     filed(state, c, item, cid)
                     save(state)
                     print(f"filed {cid}: {item['title']}  ({label(c)})")
@@ -601,7 +614,11 @@ def apply(skip: set[int]) -> int:
                 if item["title"] in done:
                     print(f"  {n:>3}. already filed: {item['title']}")
                     continue
-                cid = post(capture_text(item, c), c)
+                cid = post(entry(item, c))
+                if cid is None:
+                    left_out(state, c, item)
+                    print(f"  {n:>3}. ignored on the board before: {item['title']}")
+                    continue
                 filed(state, c, item, cid)
                 save(state)
                 print(f"  {n:>3}. filed {cid}: {item['title']}")

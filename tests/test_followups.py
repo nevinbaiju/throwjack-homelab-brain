@@ -1,4 +1,4 @@
-"""bin/brain-followups: conversations in, captures out, nothing filed twice.
+"""bin/brain-followups: conversations in, Homelab Backlog items out, nothing filed twice.
 
 Scratch transcripts and a scratch state dir; the model call (ask) and the brain's HTTP API
 are stubbed, so nothing here runs a model or reaches the real brain.
@@ -96,8 +96,12 @@ check("titles are one line, contexts bounded",
 check("at most MAX_ITEMS per conversation", len(got) <= fu.MAX_ITEMS, len(got))
 rated = fu.clean([{"title": "Rotate the leaked key", "context": "", "consequence": "breaks"},
                   {"title": "Tidy the notes", "context": "", "consequence": "whenever"}])
-check("a rating becomes the P-level triage parses",
-      fu.capture_text(rated[0], {"id": "x" * 12, "cwd": None}).startswith("P1: Rotate"), rated[0])
+e = fu.entry(rated[0], {"id": "x" * 12, "cwd": None})
+check("the rating goes with the item, and the title is sent as written",
+      e["consequence"] == "breaks" and e["title"] == "Rotate the leaked key", e)
+check("the key is stable across rewordings the dedupe already ignores",
+      e["key"] == fu.entry(dict(rated[0], title="rotate the  leaked key."),
+                           {"id": "x" * 12, "cwd": None})["key"], e)
 check("an unknown rating falls back to improves", rated[1]["consequence"] == "improves", rated[1])
 
 # --- run: first run, filing, rereads ------------------------------------------
@@ -106,8 +110,8 @@ proposals = {"aaaaaaaa-1111": [{"title": "Run the duplex test", "context": "Driv
 def fake_extract(c, state):
     extracted.append((c["id"], fu.prompt(c, state)))
     return list(proposals.get(c["id"], []))
-def fake_post(text, c):
-    posted.append(text)
+def fake_post(e):
+    posted.append(e)
     return f"c_{len(posted):012d}"
 fu.ask, fu.post, fu.busy = fake_extract, fake_post, lambda: busy
 
@@ -119,9 +123,11 @@ check("first run counts every conversation that ended as read", str(A) in state[
 write(A, [rec("user", "the printer jams on duplex"),
           rec("assistant", [{"type": "text", "text": "Try it after the firmware update."}])])
 check("a grown, quiet conversation runs", fu.run() == 0)
-check("its loose end is filed", len(posted) == 1 and "Run the duplex test" in posted[0], posted)
-check("unrated, it goes in as P3, never as triage's guess", posted[0].startswith("P3: Run the duplex test"), posted)
-check("the capture says where to pick it up", "claude --resume aaaaaaaa-1111" in posted[0], posted)
+check("its loose end is filed", len(posted) == 1 and posted[0]["title"] == "Run the duplex test", posted)
+check("unrated, it goes in as improves", posted[0]["consequence"] == "improves", posted)
+check("the note keeps the context and says where to pick it up",
+      posted[0]["note"].startswith("Driver is in.\n")
+      and "claude --resume aaaaaaaa-1111" in posted[0]["note"], posted)
 state = fu.load()
 check("what was filed is remembered", state["filed"]["aaaaaaaa-1111"][0]["capture"] == "c_000000000001", state["filed"])
 
@@ -152,10 +158,10 @@ busy = set()
 
 # --- failures ------------------------------------------------------------------
 proposals["aaaaaaaa-1111"] = [{"title": "Order toner", "context": ""}, {"title": "Mount the shelf", "context": ""}]
-def post_then_fail(text, c):
-    if posted and "Order toner" in posted[-1]:
+def post_then_fail(e):
+    if posted and posted[-1]["title"] == "Order toner":
         raise urllib.error.URLError("connection refused")
-    return fake_post(text, c)
+    return fake_post(e)
 fu.post = post_then_fail
 check("the brain being down fails the run", fu.run() == 1)
 state = fu.load()
@@ -197,7 +203,7 @@ fu.dry(["30"])
 check("dry leaves out what is still going", all(p["id"] != "nnnnnnnn-7777" for p in json.load(open(fu.PLAN))["conversations"]))
 fu.apply({2})
 check("apply files the list minus what was left out",
-      len(posted) == 1 and posted[0].startswith("P3: Reboot the router"), posted)
+      [p["title"] for p in posted] == ["Reboot the router"], posted)
 check("apply cannot run twice", not os.path.exists(fu.PLAN))
 state = fu.load()
 check("a conversation older than the window counts as read", str(OLD) in state["read"], state["read"].keys())
@@ -232,10 +238,23 @@ proposals = {"bbbbbbbb-4444": [{"title": "Label the cables", "context": ""},
 posted.clear(); extracted.clear()
 fu.run()
 check("something left out is not filed by a later read, from any conversation",
-      [p.splitlines()[0] for p in posted] == ["P3: Buy a switch"], posted)
+      [p["title"] for p in posted] == ["Buy a switch"], posted)
 check("and every later read is told about it",
       len(extracted) == 2 and all("- Label the cables" in p for _, p in extracted),
       [p[:300] for _, p in extracted])
+
+# --- ignored on the board ---------------------------------------------------------
+write(C, [rec("user", "and the shelf"), rec("assistant", [{"type": "text", "text": "Next week."}])])
+proposals = {"cccccccc-8888": [{"title": "Mount the shelf bracket", "context": ""}]}
+fu.post = lambda e: posted.append(e) and None
+posted.clear()
+check("an item you ignored on the board is not an error", fu.run() == 0)
+state = fu.load()
+check("it counts as left out, not filed",
+      "Mount the shelf bracket" in [o["title"] for o in state["left_out"].get("cccccccc-8888", [])]
+      and all(f["title"] != "Mount the shelf bracket" for f in state["filed"].get("cccccccc-8888", [])),
+      state)
+fu.post = fake_post
 
 print()
 print("FAILED: " + ", ".join(fails) if fails else "all followups tests passed")

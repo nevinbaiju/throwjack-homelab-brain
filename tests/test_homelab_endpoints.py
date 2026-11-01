@@ -62,8 +62,13 @@ check("plain text works: first line is the title",
       r2["title"] == "Sort out the array spindown", r2["title"])
 check("...and the rest is the note", r2["note"] == "half-done in .env", r2["note"])
 
+out3 = run(A.homelab_add(Req({"title": "Shred the CA key", "consequence": "costs"}), TOK))
+check("the agent's own rating is kept", conn.execute(
+    "SELECT consequence FROM tasks WHERE id=?", (out3["id"],)).fetchone()[0] == "costs")
+
 for bad, why in (({"title": ""}, "an empty title"),
-                 ({"title": "x", "track": "nonsense"}, "an unknown track")):
+                 ({"title": "x", "track": "nonsense"}, "an unknown track"),
+                 ({"title": "x", "consequence": "urgent"}, "an unknown consequence")):
     try:
         run(A.homelab_add(Req(bad), TOK)); check(f"{why} is refused", False)
     except A.HTTPException as e:

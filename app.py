@@ -421,14 +421,16 @@ async def homelab_add(request: Request,
     minutes, so the same loose end WILL be posted more than once. A repost
     updates the title and note of the existing row rather than making a twin.
 
-    Body: JSON {title, note?, key?, track?} or plain text whose first line is
-    the title and the rest the note.
+    Body: JSON {title, note?, key?, track?, consequence?} or plain text whose
+    first line is the title and the rest the note. `consequence` is the agent's
+    own rating (default improves); it orders the queue and stays with the task
+    when it is promoted.
     """
     _require_auth(authorization, session)
-    import store
+    import score, store
 
     title = note = key = ""
-    track = "focus"
+    track, consequence = "focus", "improves"
     # The established value for this producer. Kept so anything already keyed on
     # it keeps working; overridable for a different filer.
     source = "claude-followup"
@@ -441,6 +443,7 @@ async def homelab_add(request: Request,
         note = str(payload.get("note") or "").strip()
         key = str(payload.get("key") or "").strip()
         track = str(payload.get("track") or "focus").strip() or "focus"
+        consequence = str(payload.get("consequence") or "improves").strip() or "improves"
         source = str(payload.get("source") or source).strip() or source
     else:
         raw = (await request.body()).decode("utf-8", errors="replace")
@@ -452,6 +455,9 @@ async def homelab_add(request: Request,
     if track not in store.TRACKS:
         raise HTTPException(status_code=400,
                             detail=f"unknown track {track!r} (have: {', '.join(store.TRACKS)})")
+    if consequence not in score.BASE:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown consequence {consequence!r} (have: {', '.join(score.BASE)})")
     title, note = title[:200], note[:2000]
 
     conn = store.connect()
@@ -475,7 +481,7 @@ async def homelab_add(request: Request,
                     "capture": existing["capture_id"]}
 
         task_id = store.create_task(conn, title=title, note=note, track=track,
-                                    lane=HOMELAB_LANE, consequence="improves")
+                                    lane=HOMELAB_LANE, consequence=consequence)
         # A provenance capture, already closed. The follow-ups agent keys its
         # state file on capture ids and archives tasks by capture_id, so one is
         # written to keep that working -- state 'done' so triage never sees it.
